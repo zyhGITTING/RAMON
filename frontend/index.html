@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<script>
+  // 子路径部署：设为占位符时自动从 URL 路径检测；也可以直接写死如 '/outapi/gptimage2'
+  window.__DATAMID_BASE_PATH__ = '__DATAMID_BASE_PATH__';
+</script>
+<script>
+  (function() {
+    if (window.location.protocol === 'file:') return;
+    var PLACEHOLDER = '__DATAMID_BASE_PATH__';
+    function normalizeBasePath(path) {
+      var value = String(path || '').trim();
+      if (!value || value === '/') return '/';
+      if (!value.startsWith('/')) value = '/' + value;
+      value = value.replace(/\/+/g, '/');
+      return value.endsWith('/') ? value : value + '/';
+    }
+    function getExplicitBasePath() {
+      if (typeof window.__DATAMID_BASE_PATH__ !== 'undefined' && window.__DATAMID_BASE_PATH__ !== null && window.__DATAMID_BASE_PATH__ !== PLACEHOLDER) {
+        return window.__DATAMID_BASE_PATH__;
+      }
+      try {
+        var params = new URLSearchParams(window.location.search);
+        var v = params.get('__base_path') || params.get('base_path');
+        if (v) return v;
+      } catch (e) {}
+      var existing = document.querySelector('base');
+      if (existing && existing.href) {
+        try { return new URL(existing.href).pathname; } catch (e) {}
+      }
+      return null;
+    }
+    function detectBasePath() {
+      var explicit = getExplicitBasePath();
+      if (explicit !== null) return normalizeBasePath(explicit);
+      var parts = window.location.pathname.split('/').filter(Boolean);
+      var last = parts[parts.length - 1] || '';
+      if (last === 'index.html' || last === 'dashboard.html') parts.pop();
+      return normalizeBasePath(parts.length ? '/' + parts.join('/') : '/');
+    }
+    var href = detectBasePath();
+    document.write('<base href="' + href.replace(/"/g, '%22') + '">');
+  })();
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>镭目科技 · 数据中台</title>
+<link rel="stylesheet" href="tailwind.css">
+<link rel="stylesheet" href="app.css">
+<script src="pako.min.js"></script>
+</head>
+<body class="flex min-h-screen">
+
+<!-- ====== 左侧导航栏（暗色不变） ====== -->
+<aside class="plat-nav w-52 min-h-screen flex-shrink-0 p-3 flex flex-col">
+  <div class="flex items-center gap-2 px-3 py-3 mb-4">
+    <img src="logo.png" class="w-11 h-auto rounded-lg object-contain" alt="镭目">
+    <div>
+      <div class="text-sm font-semibold text-white">数据中台</div>
+      <div class="text-xs text-slate-500">数据枢纽</div>
+    </div>
+  </div>
+
+  <nav class="flex-1 space-y-0.5" id="platNav">
+    <!-- 动态平台导航由 JS 渲染 -->
+  </nav>
+
+  <!-- 管理员专区 — 仅 admin 可见 -->
+  <div id="adminSidebarSection" class="dm-hidden pt-3 border-t border-slate-700/30 mt-2">
+    <div class="text-xs text-slate-500 px-3 py-1 mb-1 tracking-wider">管理后台</div>
+    <nav class="space-y-0.5" id="adminSideNav">
+      <div class="admin-nav-item" data-admin="users"><span class="nav-text"><svg class="nav-ic" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>用户管理</span></div>
+      <div class="admin-nav-item" data-admin="datasources"><span class="nav-text"><svg class="nav-ic" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>数据源管理</span></div>
+      <div class="admin-nav-item" data-admin="sync"><span class="nav-text"><svg class="nav-ic" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>数据同步</span></div>
+      <div class="admin-nav-item" data-admin="mcp"><span class="nav-text"><svg class="nav-ic" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><polyline points="3.29 7 12 12 20.71 7"/><line x1="12" y1="22" x2="12" y2="12"/></svg>MCP 看板</span></div>
+      <div class="admin-nav-item" data-admin="mcp_request"><span class="nav-text"><svg class="nav-ic" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>MCP 申请</span><span class="nav-badge" id="dmMcpReqBadge">0</span></div>
+      <div class="admin-nav-item" data-admin="audit"><span class="nav-text"><svg class="nav-ic" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><line x1="8" y1="11" x2="16" y2="11"/><line x1="8" y1="15" x2="16" y2="15"/><line x1="8" y1="19" x2="12" y2="19"/></svg>审计日志</span></div>
+    </nav>
+  </div>
+
+  <!-- 个人专区 —— 普通用户可见 -->
+  <div id="userSidebarSection" class="dm-hidden pt-3 border-t border-slate-700/30">
+    <div class="text-xs text-slate-500 px-3 py-1 mb-1 tracking-wider">我的</div>
+    <nav class="space-y-0.5" id="userSideNav">
+      <!-- 由 JS 动态渲染 -->
+    </nav>
+  </div>
+
+  <div class="pt-3 border-t border-slate-700/30 mt-auto">
+    <div class="flex items-center gap-2 px-3 mb-2">
+      <span id="dmNavChip" class="text-xs text-slate-500">未登录</span>
+    </div>
+    <div class="flex flex-col gap-1 px-3">
+      <button id="dmNavLoginBtn" class="text-xs text-slate-400 hover:text-slate-200 transition-colors text-left" type="button">登录</button>
+      <button id="dmNavLogoutBtn" class="dm-hidden text-xs text-slate-400 hover:text-red-400 transition-colors text-left" type="button">退出登录</button>
+    </div>
+    <div class="flex items-center gap-2 px-3 mt-2">
+      <span class="pulse-dot online"></span>
+      <span class="text-xs text-slate-500" id="onlineCount">8/10 在线</span>
+    </div>
+    <div class="text-xs text-slate-600 mt-1 px-3" id="updateTime">最后更新: --</div>
+  </div>
+</aside>
+
+<!-- ====== 主内容区（白色系） ====== -->
+<main class="flex-1 overflow-y-auto p-6" id="mainContent"></main>
+
+<!-- ====== 浮层（登录/注册/MCP导出/权限分配） ====== -->
+<div class="dm-mask dm-hidden" id="dmLoginMask">
+  <div class="dm-modal">
+    <div class="dm-modal-head">
+      <div><h2>登录数据中台</h2><p>保留当前页面布局，只在浮层里完成认证。</p></div>
+    </div>
+    <div class="dm-modal-body">
+      <div class="dm-auth-tabs">
+        <button type="button" class="active" id="dmShowLogin">账号登录</button>
+        <button type="button" id="dmShowRegister">新用户注册</button>
+      </div>
+      <form class="dm-login-grid" id="dmLoginForm">
+        <label><span>用户名</span><input id="dmUsername" placeholder="请输入用户名"></label>
+        <label><span>密码</span><input id="dmPassword" type="password" placeholder="请输入密码"></label>
+        <div class="dm-login-actions"><button class="dm-submit" type="submit">登录</button></div>
+      </form>
+      <form class="dm-login-grid dm-hidden" id="dmRegisterForm">
+        <div class="dm-form-note">账号必须是 120 开头的 10 位工号</div>
+        <label><span>工号</span><input id="dmRegisterEmployeeNo" placeholder="120 开头 10 位工号"></label>
+        <label><span>用户名</span><input id="dmRegisterUsername" placeholder="与工号保持一致"></label>
+        <label><span>姓名</span><input id="dmRegisterFullName" placeholder="请输入姓名"></label>
+        <label><span>密码</span><input id="dmRegisterPassword" type="password" placeholder="至少8位，含大小写字母、数字、符号"></label>
+        <label><span>确认密码</span><input id="dmRegisterConfirmPassword" type="password" placeholder="再次输入密码"></label>
+        <div class="dm-login-actions"><button class="dm-submit" type="submit">注册并登录</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div class="dm-mask dm-hidden" id="dmMcpMask">
+  <div class="dm-modal dm-modal-light">
+    <div class="dm-modal-head">
+      <div><h2>MCP 配置导出</h2><p>一键导出 MCP 配置 JSON，可直接粘贴到 Claw / Hermes / Codex 使用。</p></div>
+      <button class="dm-close" id="dmMcpClose" type="button">×</button>
+    </div>
+    <div class="dm-modal-body" id="dmMcpBody">
+      <div style="border:1px solid #dbeafe;border-radius:12px;background:#f8fbff;padding:16px;margin:0;">
+        <p style="color:#64748b;font-size:13px;">正在检查您的数据权限...</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="dm-mask dm-hidden" id="dmDocMask" style="z-index:99;">
+  <div class="dm-modal dm-modal-light" style="max-width:min(900px,calc(100vw - 40px));">
+    <div class="dm-modal-head">
+      <div><h2 id="dmDocTitle">接口文档</h2><p id="dmDocSubtitle">可直接复制全文，或粘贴到文档中使用。</p></div>
+      <button class="dm-close" id="dmDocClose" type="button">×</button>
+    </div>
+    <div class="dm-modal-body" id="dmDocBody" style="max-height:min(70vh,600px);overflow:auto;">
+      <div style="border:1px solid #dbeafe;border-radius:12px;background:#f8fbff;padding:16px;">
+        <p style="color:#64748b;font-size:13px;">正在加载接口文档...</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="dm-mask dm-hidden" id="dmPermMask">
+  <div class="dm-modal dm-modal-light">
+    <div class="dm-modal-head">
+      <div><h2>分配权限</h2><p id="dmPermUserName"></p></div>
+      <button class="dm-close" id="dmPermClose" type="button">×</button>
+    </div>
+    <div class="dm-modal-body" id="dmPermBody"></div>
+  </div>
+</div>
+
+<div class="dm-mask dm-hidden" id="dmMcpApplyMask">
+  <div class="dm-modal dm-modal-light">
+    <div class="dm-modal-head">
+      <div><h2>申请 MCP 导出权限</h2><p id="dmMcpApplySourceName"></p></div>
+      <button class="dm-close" id="dmMcpApplyClose" type="button">×</button>
+    </div>
+    <div class="dm-modal-body">
+      <label style="display:flex;flex-direction:column;gap:6px;font-size:13px;color:#334155;">
+        <span>申请原因</span>
+        <textarea id="dmMcpApplyReason" rows="4" placeholder="请说明申请该数据源 MCP 导出权限的原因" style="width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:13px;resize:vertical;box-sizing:border-box;"></textarea>
+      </label>
+      <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end;">
+        <button class="dm-btn" id="dmMcpApplyCancel" type="button">取消</button>
+        <button class="dm-btn primary" id="dmMcpApplySubmit" type="button">提交申请</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 接口详情弹窗 ====== -->
+<div class="dm-mask dm-hidden" id="dmDsDetailMask">
+  <div class="dm-modal dm-modal-wide dm-modal-light" style="display:flex;flex-direction:column;max-height:92vh;">
+    <!-- 顶部标题栏 -->
+    <div class="dm-modal-head" style="flex-shrink:0;padding:18px 22px;">
+      <div style="flex:1;min-width:0;">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <h2 id="dmDdTitle" style="margin:0;font-size:20px;font-weight:700;"></h2>
+          <span id="dmDdMethod" style="font-size:11px;padding:2px 8px;border-radius:4px;font-family:monospace;"></span>
+          <span id="dmDdStatus"></span>
+        </div>
+        <p id="dmDdDesc" style="margin:5px 0 0;font-size:13px;color:#64748b;"></p>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
+        <button class="dm-btn dm-hidden" id="dmDdDocBtn" style="font-size:12px;padding:6px 14px;display:none;">接口文档</button>
+        <button class="dm-btn dm-hidden" id="dmDdMcpHttpBtn" style="font-size:12px;padding:6px 14px;">MCP(HTTP) 导出</button>
+        <button class="dm-btn dm-hidden" id="dmDdMcpBtn" style="font-size:12px;padding:6px 14px;">MCP 导出</button>
+        <button class="dm-btn primary dm-hidden" id="dmDdEditBtn" style="font-size:12px;padding:6px 14px;display:flex;align-items:center;gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>编辑</button>
+        <button class="dm-close" id="dmDsDetailClose" type="button">×</button>
+      </div>
+    </div>
+    <!-- 横向主体：左栏 + 右栏 -->
+    <div style="display:flex;flex:1;overflow:hidden;border-top:1px solid #e2e8f0;">
+      <!-- 左栏：字段说明 -->
+      <div id="dmDdFieldPanel" style="width:260px;flex-shrink:0;border-right:1px solid #e2e8f0;padding:20px;overflow-y:auto;background:#f8fafc;"></div>
+      <!-- 右栏：数据预览 -->
+      <div id="dmDsDetailBody" style="flex:1;overflow:auto;padding:24px;background:#fff;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 接口编辑弹窗 ====== -->
+<div class="dm-mask dm-hidden" id="dmDsEditMask">
+  <div class="dm-modal dm-modal-light" style="width:min(1180px,calc(100vw - 40px));max-height:min(82vh,760px);aspect-ratio:16 / 9;display:flex;flex-direction:column;">
+    <div class="dm-modal-head">
+      <div><h2 style="margin:0;font-size:17px;">编辑数据源</h2><p id="dmDeSubtitle" style="margin:4px 0 0;font-size:12px;"></p></div>
+      <button class="dm-close" id="dmDsEditClose" type="button">×</button>
+    </div>
+    <div class="dm-modal-body" style="flex:1;overflow:hidden;display:flex;flex-direction:column;padding-bottom:0;">
+      <div style="flex:1;overflow:auto;padding-bottom:16px;">
+        <!-- 只读信息块 -->
+        <div id="dmDeInfoBlock" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-bottom:14px;display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:12px;">
+          <div><span style="color:#94a3b8;">标识符</span> <code id="dmDeInfoKey" style="color:#334155;background:#e2e8f0;padding:1px 5px;border-radius:3px;"></code></div>
+          <div><span style="color:#94a3b8;">存储表</span> <code id="dmDeInfoTable" style="color:#334155;background:#e2e8f0;padding:1px 5px;border-radius:3px;"></code></div>
+          <div><span style="color:#94a3b8;">最后同步</span> <span id="dmDeInfoSync" style="color:#334155;"></span></div>
+          <div><span style="color:#94a3b8;">Token 状态</span> <span id="dmDeInfoToken" style="color:#334155;"></span></div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;align-items:start;min-height:0;">
+          <div style="display:flex;flex-direction:column;gap:0;">
+            <div class="dm-form-row"><label>名称</label><input id="dmDeSourceName" placeholder="显示名称"></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <div class="dm-form-row"><label>请求方式</label>
+                <select id="dmDeMethod"><option value="POST">POST</option><option value="GET">GET</option></select>
+              </div>
+              <div class="dm-form-row"><label>所属平台</label>
+                <select id="dmDePlatform"><option value="">— 不指定 —</option></select>
+              </div>
+            </div>
+            <div class="dm-form-row"><label>接口 URL</label><input id="dmDeUrl" placeholder="https://..."></div>
+            <div class="dm-form-row">
+              <label>授权 Token</label>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input id="dmDeToken" type="password" placeholder="留空表示保持不变；输入 clear 可清除已有 Token" style="flex:1;">
+                <button class="dm-btn" id="dmDeTokenToggle" type="button" style="white-space:nowrap;padding:8px 12px;">显示</button>
+              </div>
+              <span class="hint">系统将自动作为 Authorization 请求头发送</span>
+            </div>
+            <div class="dm-form-row"><label>描述</label><textarea id="dmDeDesc" rows="4" placeholder="接口用途说明"></textarea></div>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#475569;margin:8px 0 4px;">
+              <input type="checkbox" id="dmDeVerifyTls">
+              验证 TLS 证书
+            </label>
+            <div class="dm-form-row"><label>可搜索字段</label><input id="dmDeSearchable" placeholder="多个字段用逗号分隔，如 sq_no, prd_no, prd_name"></div>
+            <div class="dm-form-row"><label>质量规则 JSON</label><textarea id="dmDeQualityRules" rows="7" placeholder='{"required_fields":["sq_no"],"unique_fields":["sq_no"]}' style="font-family:monospace;"></textarea></div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:0;">
+            <div class="dm-form-row"><label>请求配置 JSON</label><textarea id="dmDeReqCfg" rows="12" placeholder='{"auth":{"header_name":"Authorization","scheme":"Bearer"},"query_template":{"page":"$page"},"payload_template":{"page":"$page","page_size":"$page_size"}}' style="font-family:monospace;"></textarea></div>
+            <div class="dm-form-row"><label>响应配置 JSON</label><textarea id="dmDeRespCfg" rows="10" placeholder='{"code_key":"code","data_key":"data.items","total_key":"data.total","success_codes":[0,200]}' style="font-family:monospace;"></textarea></div>
+          </div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;padding:14px 0 18px;border-top:1px solid #e2e8f0;background:#fff;position:sticky;bottom:0;">
+        <button class="dm-btn danger" id="dmDeDelete" type="button">删除数据源</button>
+        <button class="dm-btn" id="dmDeFieldPerm" type="button" style="margin-right:auto;">字段权限</button>
+        <button class="dm-btn" id="dmDeCancel" type="button">取消</button>
+        <button class="dm-btn primary" id="dmDeSave" type="button" onclick="window.handleDatasourceSave && window.handleDatasourceSave()">保存修改</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="dm-mask dm-hidden" id="dmDsDeleteMask">
+  <div class="dm-modal dm-modal-light" style="width:min(520px,calc(100vw - 40px));max-height:90vh;display:flex;flex-direction:column;">
+    <div class="dm-modal-head">
+      <div><h2 style="margin:0;font-size:17px;">删除数据源</h2><p id="dmDsDeleteSubtitle" style="margin:4px 0 0;font-size:12px;"></p></div>
+      <button class="dm-close" id="dmDsDeleteClose" type="button">×</button>
+    </div>
+    <div class="dm-modal-body" style="display:flex;flex-direction:column;gap:14px;">
+      <div style="border:1px solid #fecaca;border-radius:12px;background:#fef2f2;padding:14px 16px;">
+        <div style="font-size:13px;font-weight:700;color:#b91c1c;margin-bottom:6px;">危险操作</div>
+        <div style="font-size:12px;color:#7f1d1d;line-height:1.7;">删除后会移除数据源配置、字段元数据、权限分配、同步版本、同步日志，以及对应的数据表内容，且不可恢复。</div>
+      </div>
+      <div class="dm-form-row" style="margin:0;">
+        <label>管理员密码确认</label>
+        <input id="dmDsDeletePassword" type="password" placeholder="请输入当前管理员密码">
+        <span class="hint">只有管理员本人输入正确密码后才能删除。</span>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;">
+        <button class="dm-btn" id="dmDsDeleteCancel">取消</button>
+        <button class="dm-btn danger" id="dmDsDeleteConfirm">确认删除</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="dm-mask dm-hidden" id="dmUserDeleteMask">
+  <div class="dm-modal dm-modal-light" style="width:min(520px,calc(100vw - 40px));max-height:90vh;display:flex;flex-direction:column;">
+    <div class="dm-modal-head">
+      <div><h2 style="margin:0;font-size:17px;">删除用户</h2><p id="dmUserDeleteSubtitle" style="margin:4px 0 0;font-size:12px;"></p></div>
+      <button class="dm-close" id="dmUserDeleteClose" type="button">×</button>
+    </div>
+    <div class="dm-modal-body" style="display:flex;flex-direction:column;gap:14px;">
+      <div style="border:1px solid #fecaca;border-radius:12px;background:#fef2f2;padding:14px 16px;">
+        <div style="font-size:13px;font-weight:700;color:#b91c1c;margin-bottom:6px;">危险操作</div>
+        <div style="font-size:12px;color:#7f1d1d;line-height:1.7;">删除后会移除该用户账号、其数据源权限、字段权限、MCP 导出令牌与导出申请记录，且不可恢复。</div>
+      </div>
+      <div class="dm-form-row" style="margin:0;">
+        <label>管理员密码确认</label>
+        <input id="dmUserDeletePassword" type="password" placeholder="请输入当前管理员密码">
+        <span class="hint">只有管理员本人输入正确密码后才能删除。</span>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;">
+        <button class="dm-btn" id="dmUserDeleteCancel">取消</button>
+        <button class="dm-btn danger" id="dmUserDeleteConfirm">确认删除</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="dm-mask dm-hidden" id="dmForcePwdMask" style="z-index:300;">
+  <div class="dm-modal dm-modal-light" style="width:min(440px,calc(100vw - 40px));">
+    <div class="dm-modal-head">
+      <div><h2 style="margin:0;font-size:17px;">请修改密码</h2><p style="margin:4px 0 0;font-size:12px;color:#64748b;">检测到你当前使用的是初始密码，为了账号安全，请先设置新密码后再继续使用</p></div>
+    </div>
+    <div class="dm-modal-body" style="display:flex;flex-direction:column;gap:12px;">
+      <div class="dm-form-row" style="margin:0;">
+        <label>新密码</label>
+        <input id="dmForcePwdNew" type="password" placeholder="至少8位，含大小写字母、数字、符号" autocomplete="new-password">
+      </div>
+      <div class="dm-form-row" style="margin:0;">
+        <label>确认新密码</label>
+        <input id="dmForcePwdNew2" type="password" placeholder="再次输入新密码" autocomplete="new-password">
+      </div>
+      <div id="dmForcePwdErr" style="display:none;font-size:12px;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:9px 12px;"></div>
+      <div style="display:flex;justify-content:flex-end;margin-top:4px;">
+        <button class="dm-btn primary" id="dmForcePwdSubmit" type="button">确认修改</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="dm-toast" id="dmToast"></div>
+
+<!-- ====== 全屏认证页（未登录时全屏显示） ====== -->
+<div id="dmAuthScreen" style="position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;padding:24px;background:#f8fafc;overflow:hidden;">
+  <!-- 极浅背景纹理：细点阵 -->
+  <div style="position:absolute;inset:0;background-image:radial-gradient(circle,#cbd5e1 1px,transparent 1px);background-size:28px 28px;opacity:.35;pointer-events:none;"></div>
+  <!-- 右上角光晕 -->
+  <div style="position:absolute;width:640px;height:640px;border-radius:50%;background:radial-gradient(circle,rgba(99,102,241,0.07) 0%,transparent 65%);top:-180px;right:-180px;pointer-events:none;"></div>
+  <!-- 左下角光晕 -->
+  <div style="position:absolute;width:480px;height:480px;border-radius:50%;background:radial-gradient(circle,rgba(99,102,241,0.05) 0%,transparent 65%);bottom:-160px;left:-160px;pointer-events:none;"></div>
+
+  <div id="dmAuthCard" style="position:relative;z-index:1;display:flex;width:min(940px,100%);min-height:560px;border-radius:20px;overflow:hidden;box-shadow:0 4px 6px rgba(0,0,0,0.03),0 20px 60px rgba(0,0,0,0.08),0 1px 0 rgba(255,255,255,0.9);border:1px solid #e2e8f0;">
+
+    <!-- 左侧品牌区 -->
+    <div id="dmAuthBrandPanel" style="flex:1;min-width:0;background:#fff;padding:60px 52px;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;overflow:hidden;">
+      <!-- 极淡点阵纹 -->
+      <div style="position:absolute;inset:0;background-image:radial-gradient(circle,#d1d5db 1px,transparent 1px);background-size:24px 24px;opacity:.3;pointer-events:none;"></div>
+      <!-- 右下装饰圆 -->
+      <div style="position:absolute;right:-80px;bottom:-80px;width:300px;height:300px;border-radius:50%;background:radial-gradient(circle,rgba(99,102,241,0.06),transparent);pointer-events:none;"></div>
+
+      <div style="display:flex;flex-direction:column;align-items:center;margin-bottom:44px;position:relative;">
+        <img src="leimo.png" alt="镭目科技" style="width:208px;height:auto;display:block;object-fit:contain;border-radius:20px;box-shadow:0 8px 40px rgba(0,0,0,0.10),0 2px 10px rgba(0,0,0,0.05);">
+        <h1 style="color:#111827;font-size:31px;font-weight:700;margin:23px 0 8px;text-align:center;">镭目科技</h1>
+        <p style="color:#9ca3af;font-size:15.5px;margin:0;text-align:center;letter-spacing:.06em;">数据中台 · 数据智能枢纽</p>
+      </div>
+
+      <div class="auth-features" style="display:flex;flex-direction:column;gap:22px;position:relative;width:100%;max-width:300px;">
+        <div style="display:flex;align-items:flex-start;gap:14px;">
+          <div style="width:34px;height:34px;border-radius:9px;background:#eff6ff;border:1px solid #dbeafe;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:#2563eb;"><svg width="16" height="16" viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></div>
+          <div><div style="color:#111827;font-size:13px;font-weight:600;margin-bottom:3px;">实时数据同步</div><div style="color:#6b7280;font-size:12px;line-height:1.6;">统一接入 ERP、SRM、考勤等核心业务系统</div></div>
+        </div>
+        <div style="display:flex;align-items:flex-start;gap:14px;">
+          <div style="width:34px;height:34px;border-radius:9px;background:#eff6ff;border:1px solid #dbeafe;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:#2563eb;"><svg width="16" height="16" viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+          <div><div style="color:#111827;font-size:13px;font-weight:600;margin-bottom:3px;">细粒度权限管控</div><div style="color:#6b7280;font-size:12px;line-height:1.6;">按人员授权数据访问，全操作可审计追溯</div></div>
+        </div>
+        <div style="display:flex;align-items:flex-start;gap:14px;">
+          <div style="width:34px;height:34px;border-radius:9px;background:#eff6ff;border:1px solid #dbeafe;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:#2563eb;"><svg width="16" height="16" viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+          <div><div style="color:#111827;font-size:13px;font-weight:600;margin-bottom:3px;">炎黄平台 SSO 免密登录</div><div style="color:#6b7280;font-size:12px;line-height:1.6;">从炎黄平台跳转可自动登录，无需再次输入密码</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右侧表单区 -->
+    <div id="dmAuthFormPanel" style="width:400px;flex-shrink:0;background:#f1f5f9;padding:60px 48px;display:flex;flex-direction:column;justify-content:center;border-left:1px solid #e2e8f0;">
+      <div style="margin-bottom:32px;">
+        <h2 style="color:#111827;font-size:22px;font-weight:700;margin:0 0 6px;letter-spacing:-.01em;">欢迎使用</h2>
+        <p style="color:#9ca3af;font-size:13px;margin:0;">请登录以查看平台数据</p>
+      </div>
+
+      <!-- Tab 切换 -->
+      <div style="display:flex;margin-bottom:26px;background:#e2e8f0;border-radius:10px;padding:3px;">
+        <button id="dmAuthTabLogin" onclick="window.dmSwitchAuthTab('login')" style="flex:1;padding:8px 12px;font-size:13px;border:none;cursor:pointer;border-radius:8px;background:#fff;color:#111827;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,0.1);transition:all .15s;">账号登录</button>
+        <button id="dmAuthTabReg" onclick="window.dmSwitchAuthTab('reg')" style="flex:1;padding:8px 12px;font-size:13px;border:none;cursor:pointer;border-radius:8px;background:transparent;color:#6b7280;font-weight:500;transition:all .15s;">新用户注册</button>
+      </div>
+
+      <!-- 登录面板 -->
+      <div id="dmAuthLoginPanel">
+        <div style="display:flex;flex-direction:column;gap:16px;">
+          <div>
+            <label style="display:block;font-size:12px;color:#374151;margin-bottom:6px;font-weight:600;letter-spacing:.01em;">用户名</label>
+            <input id="dmAuthUser" placeholder="请输入用户名" autocomplete="username" class="dm-auth-input">
+          </div>
+          <div>
+            <label style="display:block;font-size:12px;color:#374151;margin-bottom:6px;font-weight:600;letter-spacing:.01em;">密码</label>
+            <input id="dmAuthPwd" type="password" placeholder="请输入密码" autocomplete="current-password" class="dm-auth-input">
+          </div>
+          <div id="dmAuthLoginErr" style="display:none;font-size:12px;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:9px 12px;"></div>
+          <button class="dm-auth-btn" onclick="window.dmAuthDoLogin()" style="margin-top:4px;">登 录</button>
+        </div>
+      </div>
+
+      <!-- 注册面板 -->
+      <div id="dmAuthRegPanel" style="display:none;">
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          <div style="font-size:11.5px;color:#6366f1;background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;padding:8px 11px;">账号必须是 120 开头的 10 位工号</div>
+          <div>
+            <label style="display:block;font-size:12px;color:#374151;margin-bottom:5px;font-weight:600;">工号</label>
+            <input id="dmAuthRegEmp" placeholder="120 开头 10 位工号" class="dm-auth-input">
+          </div>
+          <div>
+            <label style="display:block;font-size:12px;color:#374151;margin-bottom:5px;font-weight:600;">用户名</label>
+            <input id="dmAuthRegUname" placeholder="与工号保持一致" class="dm-auth-input">
+          </div>
+          <div>
+            <label style="display:block;font-size:12px;color:#374151;margin-bottom:5px;font-weight:600;">姓名</label>
+            <input id="dmAuthRegName" placeholder="请输入姓名" class="dm-auth-input">
+          </div>
+          <div>
+            <label style="display:block;font-size:12px;color:#374151;margin-bottom:5px;font-weight:600;">密码</label>
+            <input id="dmAuthRegPwd" type="password" placeholder="至少8位，含大小写字母、数字、符号" autocomplete="new-password" class="dm-auth-input">
+          </div>
+          <div>
+            <label style="display:block;font-size:12px;color:#374151;margin-bottom:5px;font-weight:600;">确认密码</label>
+            <input id="dmAuthRegPwd2" type="password" placeholder="再次输入密码" autocomplete="new-password" class="dm-auth-input">
+          </div>
+          <div id="dmAuthRegErr" style="display:none;font-size:12px;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:9px 12px;"></div>
+          <button class="dm-auth-btn" onclick="window.dmAuthDoRegister()">注册并登录</button>
+        </div>
+      </div>
+
+      <p style="margin:24px 0 0;font-size:12px;color:#d1d5db;text-align:center;">© 2025 镭目科技 · 数据中台</p>
+    </div>
+
+  </div>
+</div>
+
+<!-- ====== 同步进度弹窗 ====== -->
+<div class="dm-mask dm-hidden" id="dmSyncProgressMask">
+  <div class="dm-modal dm-modal-light" style="width:min(700px,calc(100vw - 40px));max-height:90vh;display:flex;flex-direction:column;">
+    <div class="dm-modal-head" style="flex-shrink:0;">
+      <h2 id="dmSyncProgressTitle" style="margin:0;font-size:17px;"></h2>
+      <button class="dm-close" id="dmSyncProgressClose" type="button">×</button>
+    </div>
+    <div style="flex-shrink:0;padding:10px 24px 0;display:flex;align-items:center;gap:8px;" id="dmSyncProgressHint">
+      <span style="font-size:12px;color:#94a3b8;">关闭窗口不会中断同步，可以继续在后台执行</span>
+      <button id="dmSyncStopBtn" class="dm-hidden" type="button"
+        style="margin-left:auto;padding:4px 14px;background:#fee2e2;color:#dc2626;border:1px solid #fca5a5;border-radius:6px;font-size:12px;cursor:pointer;font-weight:500;">
+        停止同步
+      </button>
+    </div>
+    <div id="dmSyncProgressBody" style="flex:1;overflow-y:auto;padding:16px 24px 24px;"></div>
+  </div>
+</div>
+
+<!-- ====== 平台占位（内容由登录后动态渲染） ====== -->
+<script src="app.js"></script>
+
+<!-- ====== 数据中台管理 JS ====== -->
+</body>
+</html>
+
+

@@ -1,0 +1,52 @@
+name: datamid
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: datamid-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: datamid
+      POSTGRES_USER: datamid
+      POSTGRES_PASSWORD: ${DATAMID_DB_PASSWORD:-datamid_pg_2024}
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/init_pg.sql:/docker-entrypoint-initdb.d/01-init.sql
+    ports:
+      - "127.0.0.1:5430:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datamid"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: datamid-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATAMID_DB_HOST=postgres
+      - DATAMID_DB_PORT=5432
+      - DATAMID_DB_NAME=datamid
+      - DATAMID_DB_USER=datamid
+      - DATAMID_DB_PASSWORD=${DATAMID_DB_PASSWORD:-datamid_pg_2024}
+      - DATAMID_HOST=0.0.0.0
+      - DATAMID_PORT=8128
+      - DATAMID_TOKEN_SECRET=${DATAMID_TOKEN_SECRET:-change-me-in-production}
+      - DATAMID_RAMON_AUTH=${DATAMID_RAMON_AUTH}
+      - DATAMID_ERP_COMPNO=ERP_GT
+      - DATAMID_PUBLIC_URL=${DATAMID_PUBLIC_URL:-http://YOUR_SERVER/data_center}
+      - DATAMID_INIT_ADMIN_PASSWORD=${DATAMID_INIT_ADMIN_PASSWORD:-}
+      - DATAMID_ALLOW_SELF_REGISTER=${DATAMID_ALLOW_SELF_REGISTER:-}
+      - TZ=Asia/Shanghai
+    ports:
+      - "127.0.0.1:8128:8128"
+
+volumes:
+  pgdata:
