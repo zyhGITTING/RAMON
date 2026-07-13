@@ -267,6 +267,7 @@ renderPlatform(); updateGlobalStatus();
   function updateLoginUI() {
     const loggedIn = !!(state.user);
     $('dmNavLoginBtn').classList.toggle('dm-hidden', loggedIn);
+    $('dmNavChangePwdBtn').classList.toggle('dm-hidden', !loggedIn);
     $('dmNavLogoutBtn').classList.toggle('dm-hidden', !loggedIn);
     $('dmNavChip').textContent = loggedIn ? (state.user.full_name || state.user.username) : '未登录';
     const isAdmin = loggedIn && state.user.role === 'admin';
@@ -436,6 +437,60 @@ renderPlatform(); updateGlobalStatus();
   });
   ['dmForcePwdNew', 'dmForcePwdNew2'].forEach(id => {
     $(id).addEventListener('keydown', e => { if (e.key === 'Enter') $('dmForcePwdSubmit').click(); });
+  });
+
+  function openChangePasswordDialog() {
+    if (!state.user) { showToast('请先登录', true); return; }
+    $('dmChangePwdOld').value = '';
+    $('dmChangePwdNew').value = '';
+    $('dmChangePwdNew2').value = '';
+    $('dmChangePwdErr').style.display = 'none';
+    $('dmChangePwdMask').classList.remove('dm-hidden');
+    setTimeout(() => $('dmChangePwdOld').focus(), 0);
+  }
+
+  function closeChangePasswordDialog() {
+    $('dmChangePwdMask').classList.add('dm-hidden');
+  }
+
+  async function submitChangePassword() {
+    const oldPwd = $('dmChangePwdOld').value || '';
+    const newPwd = $('dmChangePwdNew').value || '';
+    const newPwd2 = $('dmChangePwdNew2').value || '';
+    const errEl = $('dmChangePwdErr');
+    errEl.style.display = 'none';
+    if (!oldPwd || !newPwd || !newPwd2) { errEl.textContent = '请填写完整'; errEl.style.display = ''; return; }
+    if (newPwd !== newPwd2) { errEl.textContent = '两次输入的新密码不一致'; errEl.style.display = ''; return; }
+    const clientErr = _validatePasswordClientSide(newPwd);
+    if (clientErr) { errEl.textContent = clientErr; errEl.style.display = ''; return; }
+    const btn = $('dmChangePwdSubmit');
+    const oldText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '修改中...';
+    try {
+      const resp = await apiFetch('/api/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ old_password: oldPwd, new_password: newPwd }),
+      });
+      state.user = resp.user || state.user;
+      closeChangePasswordDialog();
+      showToast('密码修改成功');
+    } catch (e) {
+      errEl.textContent = e.message;
+      errEl.style.display = '';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldText;
+    }
+  }
+
+  $('dmNavChangePwdBtn').addEventListener('click', openChangePasswordDialog);
+  $('dmChangePwdClose').addEventListener('click', closeChangePasswordDialog);
+  $('dmChangePwdCancel').addEventListener('click', closeChangePasswordDialog);
+  $('dmChangePwdSubmit').addEventListener('click', submitChangePassword);
+  $('dmChangePwdMask').addEventListener('click', e => { if (e.target === $('dmChangePwdMask')) closeChangePasswordDialog(); });
+  ['dmChangePwdOld', 'dmChangePwdNew', 'dmChangePwdNew2'].forEach(id => {
+    $(id).addEventListener('keydown', e => { if (e.key === 'Enter') submitChangePassword(); });
   });
 
   window.dmAuthDoLogin = async function() {

@@ -49,6 +49,33 @@ def _build_mcp_config(token: str, source_keys: list[str], endpoint_template: str
     return json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2)
 
 
+def _find_existing_active_token(conn, user, source_keys: list[str]):
+    requested = sorted({str(item).strip() for item in source_keys if str(item).strip()})
+    rows = conn.execute(
+        """
+        SELECT * FROM sys_mcp_token
+        WHERE user_id = ?
+          AND COALESCE(user_deleted, 0) = 0
+          AND status = 'active'
+        ORDER BY id DESC
+        """,
+        (user["id"],),
+    ).fetchall()
+    for row in rows:
+        try:
+            existing = sorted({str(item).strip() for item in json.loads(row["source_keys_json"] or "[]") if str(item).strip()})
+        except Exception:
+            continue
+        if existing == requested:
+            return row
+    return None
+
+
+def _ensure_not_duplicate_export(conn, user, source_keys: list[str]) -> None:
+    if _find_existing_active_token(conn, user, source_keys):
+        raise HTTPException(status_code=409, detail="该数据源已经导出过 MCP，请到我的 MCP 列表中查看。")
+
+
 def _build_mcp_export_response(
     issued: dict[str, Any],
     config_json: str,
@@ -88,12 +115,14 @@ def api_mcp_export(request: Request, payload: McpExportRequest, source_key: str 
     client_ip = resolve_client_ip(request)
     conn = get_connection()
     try:
+        expire_stale_mcp_tokens(conn)
         allowed = get_effective_source_keys(conn, user)
         requested = payload.source_keys[:] if payload.source_keys else ([source_key] if source_key else sorted(allowed))
         if user["role"] != "admin":
             denied = [item for item in requested if item not in allowed]
             if denied:
                 raise HTTPException(status_code=403, detail=f"No export permission for: {', '.join(denied)}")
+        _ensure_not_duplicate_export(conn, user, requested)
         issued = issue_mcp_token(conn, user, requested, payload.bind_ip, client_ip)
         config_json = _build_mcp_config(issued["token"], issued["source_keys"], SSE_ENDPOINT_TEMPLATE, PUBLIC_URL)
         config_json_http = _build_mcp_config(issued["token"], issued["source_keys"], HTTP_ENDPOINT_TEMPLATE, PUBLIC_URL)
@@ -110,12 +139,14 @@ def api_mcp_export_http(request: Request, payload: McpExportRequest, source_key:
     client_ip = resolve_client_ip(request)
     conn = get_connection()
     try:
+        expire_stale_mcp_tokens(conn)
         allowed = get_effective_source_keys(conn, user)
         requested = payload.source_keys[:] if payload.source_keys else ([source_key] if source_key else sorted(allowed))
         if user["role"] != "admin":
             denied = [item for item in requested if item not in allowed]
             if denied:
                 raise HTTPException(status_code=403, detail=f"No export permission for: {', '.join(denied)}")
+        _ensure_not_duplicate_export(conn, user, requested)
         issued = issue_mcp_token(conn, user, requested, payload.bind_ip, client_ip)
         config_json = _build_mcp_config(issued["token"], issued["source_keys"], SSE_ENDPOINT_TEMPLATE, PUBLIC_URL)
         config_json_http = _build_mcp_config(issued["token"], issued["source_keys"], HTTP_ENDPOINT_TEMPLATE, PUBLIC_URL)

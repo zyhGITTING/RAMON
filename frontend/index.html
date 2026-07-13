@@ -93,6 +93,7 @@
     </div>
     <div class="flex flex-col gap-1 px-3">
       <button id="dmNavLoginBtn" class="text-xs text-slate-400 hover:text-slate-200 transition-colors text-left" type="button">登录</button>
+      <button id="dmNavChangePwdBtn" class="dm-hidden text-xs text-slate-400 hover:text-slate-200 transition-colors text-left" type="button">修改密码</button>
       <button id="dmNavLogoutBtn" class="dm-hidden text-xs text-slate-400 hover:text-red-400 transition-colors text-left" type="button">退出登录</button>
     </div>
     <div class="flex items-center gap-2 px-3 mt-2">
@@ -348,6 +349,34 @@
       <div id="dmForcePwdErr" style="display:none;font-size:12px;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:9px 12px;"></div>
       <div style="display:flex;justify-content:flex-end;margin-top:4px;">
         <button class="dm-btn primary" id="dmForcePwdSubmit" type="button">确认修改</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="dm-mask dm-hidden" id="dmChangePwdMask" style="z-index:260;">
+  <div class="dm-modal dm-modal-light" style="width:min(460px,calc(100vw - 40px));">
+    <div class="dm-modal-head">
+      <div><h2 style="margin:0;font-size:17px;">修改密码</h2><p style="margin:4px 0 0;font-size:12px;color:#64748b;">管理员和普通用户都可以修改自己的登录密码</p></div>
+      <button class="dm-close" id="dmChangePwdClose" type="button">×</button>
+    </div>
+    <div class="dm-modal-body" style="display:flex;flex-direction:column;gap:12px;">
+      <div class="dm-form-row" style="margin:0;">
+        <label>当前密码</label>
+        <input id="dmChangePwdOld" type="password" placeholder="请输入当前密码" autocomplete="current-password">
+      </div>
+      <div class="dm-form-row" style="margin:0;">
+        <label>新密码</label>
+        <input id="dmChangePwdNew" type="password" placeholder="至少8位，含大小写字母、数字、符号" autocomplete="new-password">
+      </div>
+      <div class="dm-form-row" style="margin:0;">
+        <label>确认新密码</label>
+        <input id="dmChangePwdNew2" type="password" placeholder="再次输入新密码" autocomplete="new-password">
+      </div>
+      <div id="dmChangePwdErr" style="display:none;font-size:12px;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:9px 12px;"></div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:4px;">
+        <button class="dm-btn" id="dmChangePwdCancel" type="button">取消</button>
+        <button class="dm-btn primary" id="dmChangePwdSubmit" type="button">确认修改</button>
       </div>
     </div>
   </div>
