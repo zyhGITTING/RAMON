@@ -15,6 +15,7 @@ from backend.app.services.datasource_service import (
     get_datasource_detail,
     get_table_row_count,
     parse_datasource_config,
+    prune_ods_table_versions,
     replace_ods_table_rows,
     sync_datasource_field_meta,
 )
@@ -208,6 +209,7 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
                     json.dumps(quality_report, ensure_ascii=False),
                 ),
             )
+            prune_ods_table_versions(conn, live_row["source_key"], live_row["table_name"])
             conn.commit()
 
         progress_status = quality_status if quality_status in {"warning", "empty"} else "success"

@@ -66,7 +66,10 @@ class _PgConnection:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        return self._conn.__exit__(exc_type, exc, tb)
+        try:
+            return self._conn.__exit__(exc_type, exc, tb)
+        finally:
+            self._conn.close()
 
 
 def get_connection() -> _PgConnection:

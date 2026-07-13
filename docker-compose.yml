@@ -8,7 +8,7 @@ services:
     environment:
       POSTGRES_DB: datamid
       POSTGRES_USER: datamid
-      POSTGRES_PASSWORD: ${DATAMID_DB_PASSWORD:-datamid_pg_2024}
+      POSTGRES_PASSWORD: ${DATAMID_DB_PASSWORD:?Set DATAMID_DB_PASSWORD in .env}
       TZ: Asia/Shanghai
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -35,10 +35,10 @@ services:
       - DATAMID_DB_PORT=5432
       - DATAMID_DB_NAME=datamid
       - DATAMID_DB_USER=datamid
-      - DATAMID_DB_PASSWORD=${DATAMID_DB_PASSWORD:-datamid_pg_2024}
+      - DATAMID_DB_PASSWORD=${DATAMID_DB_PASSWORD:?Set DATAMID_DB_PASSWORD in .env}
       - DATAMID_HOST=0.0.0.0
       - DATAMID_PORT=8128
-      - DATAMID_TOKEN_SECRET=${DATAMID_TOKEN_SECRET:-change-me-in-production}
+      - DATAMID_TOKEN_SECRET=${DATAMID_TOKEN_SECRET:?Set DATAMID_TOKEN_SECRET in .env}
       - DATAMID_RAMON_AUTH=${DATAMID_RAMON_AUTH}
       - DATAMID_ERP_COMPNO=ERP_GT
       - DATAMID_PUBLIC_URL=${DATAMID_PUBLIC_URL:-http://YOUR_SERVER/data_center}

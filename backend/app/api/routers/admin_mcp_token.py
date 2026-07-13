@@ -10,9 +10,9 @@ from backend.app.api.deps import get_current_user, require_admin
 from backend.app.core.config import APP_PORT
 from backend.app.db.connection import get_connection
 from backend.app.db.repositories.audit import record_audit_log
-from backend.app.schemas.mcp import McpExportRequest, McpTokenRevokeRequest
+from backend.app.schemas.mcp import McpExportRequest, McpTokenExpiryUpdateRequest, McpTokenRevokeRequest
 from backend.app.services.auth_service import resolve_client_ip
-from backend.app.services.mcp_service import expire_stale_mcp_tokens, issue_mcp_token, now_text, serialize_mcp_token_row, update_mcp_token_configs
+from backend.app.services.mcp_service import expire_stale_mcp_tokens, expiry_for_validity_period, issue_mcp_token, now_text, normalize_validity_period, serialize_mcp_token_row, update_mcp_token_configs
 from backend.app.services.permission_service import get_effective_source_keys
 
 router = APIRouter()
@@ -76,6 +76,24 @@ def _ensure_not_duplicate_export(conn, user, source_keys: list[str]) -> None:
         raise HTTPException(status_code=409, detail="该数据源已经导出过 MCP，请到我的 MCP 列表中查看。")
 
 
+def _resolve_export_validity_period(conn, user, requested: list[str], payload_period: str = "") -> str:
+    explicit = str(payload_period or "").strip()
+    if explicit:
+        return normalize_validity_period(explicit)
+    if len(requested) == 1:
+        row = conn.execute(
+            """
+            SELECT validity_period FROM sys_mcp_export_request
+            WHERE user_id = ? AND source_key = ? AND status = 'approved'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user["id"], requested[0]),
+        ).fetchone()
+        if row:
+            return normalize_validity_period(row.get("validity_period") or "3m")
+    return "3m"
+
+
 def _build_mcp_export_response(
     issued: dict[str, Any],
     config_json: str,
@@ -123,7 +141,8 @@ def api_mcp_export(request: Request, payload: McpExportRequest, source_key: str 
             if denied:
                 raise HTTPException(status_code=403, detail=f"No export permission for: {', '.join(denied)}")
         _ensure_not_duplicate_export(conn, user, requested)
-        issued = issue_mcp_token(conn, user, requested, payload.bind_ip, client_ip)
+        validity_period = _resolve_export_validity_period(conn, user, requested, payload.validity_period)
+        issued = issue_mcp_token(conn, user, requested, payload.bind_ip, client_ip, validity_period)
         config_json = _build_mcp_config(issued["token"], issued["source_keys"], SSE_ENDPOINT_TEMPLATE, PUBLIC_URL)
         config_json_http = _build_mcp_config(issued["token"], issued["source_keys"], HTTP_ENDPOINT_TEMPLATE, PUBLIC_URL)
         update_mcp_token_configs(conn, issued["id"], config_json, config_json_http)
@@ -147,7 +166,8 @@ def api_mcp_export_http(request: Request, payload: McpExportRequest, source_key:
             if denied:
                 raise HTTPException(status_code=403, detail=f"No export permission for: {', '.join(denied)}")
         _ensure_not_duplicate_export(conn, user, requested)
-        issued = issue_mcp_token(conn, user, requested, payload.bind_ip, client_ip)
+        validity_period = _resolve_export_validity_period(conn, user, requested, payload.validity_period)
+        issued = issue_mcp_token(conn, user, requested, payload.bind_ip, client_ip, validity_period)
         config_json = _build_mcp_config(issued["token"], issued["source_keys"], SSE_ENDPOINT_TEMPLATE, PUBLIC_URL)
         config_json_http = _build_mcp_config(issued["token"], issued["source_keys"], HTTP_ENDPOINT_TEMPLATE, PUBLIC_URL)
         update_mcp_token_configs(conn, issued["id"], config_json, config_json_http)
@@ -348,5 +368,27 @@ def admin_mcp_token_revoke(token_id: int, payload: McpTokenRevokeRequest, admin=
         conn.commit()
         record_audit_log(admin["username"], admin["role"], "revoke_mcp_token", "sys_mcp_token", f"id={token_id};user={row['username']};reason={reason}")
         return {"message": "MCP token revoked", "id": token_id}
+    finally:
+        conn.close()
+
+
+@router.post("/api/admin/mcp-token/{token_id}/expiry")
+def admin_mcp_token_update_expiry(token_id: int, payload: McpTokenExpiryUpdateRequest, admin=Depends(require_admin)) -> dict[str, Any]:
+    period = normalize_validity_period(payload.validity_period)
+    _, expires_at = expiry_for_validity_period(period)
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM sys_mcp_token WHERE id = ? LIMIT 1", (token_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="MCP token not found")
+        new_status = "active" if str(row["status"] or "active").strip().lower() == "expired" else (row["status"] or "active")
+        conn.execute(
+            "UPDATE sys_mcp_token SET validity_period = ?, expires_at = ?, status = ? WHERE id = ?",
+            (period, expires_at, new_status, token_id),
+        )
+        conn.commit()
+        updated = conn.execute("SELECT * FROM sys_mcp_token WHERE id = ? LIMIT 1", (token_id,)).fetchone()
+        record_audit_log(admin["username"], admin["role"], "update_mcp_token_expiry", "sys_mcp_token", f"id={token_id};user={row['username']};validity_period={period};expires_at={expires_at}")
+        return {"message": "MCP token expiry updated", "item": serialize_mcp_token_row(updated)}
     finally:
         conn.close()

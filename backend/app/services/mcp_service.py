@@ -11,12 +11,39 @@ from fastapi import HTTPException
 
 from backend.app.services.auth_service import _decode_signed_token, _sign_payload
 from backend.app.services.llm_service import parse_json_array
+from backend.app.services.permission_service import has_source_permission
 
 MCP_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 90
+MCP_VALIDITY_PERIODS = {
+    "3m": {"days": 90, "label": "3个月"},
+    "6m": {"days": 180, "label": "6个月"},
+    "permanent": {"days": None, "label": "永久"},
+}
+MCP_PERMANENT_EXP_TS = 253402271999
+MCP_PERMANENT_EXPIRES_AT = "9999-12-31 23:59:59"
 
 
 def now_text() -> str:
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalize_validity_period(value: str) -> str:
+    period = str(value or "").strip().lower()
+    return period if period in MCP_VALIDITY_PERIODS else "3m"
+
+
+def validity_period_label(value: str) -> str:
+    return MCP_VALIDITY_PERIODS[normalize_validity_period(value)]["label"]
+
+
+def expiry_for_validity_period(value: str) -> tuple[int, str]:
+    period = normalize_validity_period(value)
+    days = MCP_VALIDITY_PERIODS[period]["days"]
+    if days is None:
+        return MCP_PERMANENT_EXP_TS, MCP_PERMANENT_EXPIRES_AT
+    exp_ts = int(time.time()) + int(days) * 24 * 60 * 60
+    expires_at = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d %H:%M:%S")
+    return exp_ts, expires_at
 
 
 def hash_token_value(value: str) -> str:
@@ -43,9 +70,11 @@ def create_mcp_token(user, source_keys: list[str], bind_ip: bool, ip: str, *, jt
 
 
 def decode_mcp_token(token: str) -> dict[str, Any]:
-    payload = _decode_signed_token(token[4:] if token.startswith("dmc_") else token)
+    payload = _decode_signed_token(token[4:] if token.startswith("dmc_") else token, verify_exp=False)
     if payload.get("type") != "mcp":
         raise HTTPException(status_code=401, detail="Invalid MCP token")
+    if not payload.get("jti") and int(payload.get("exp", 0)) < int(time.time()):
+        raise HTTPException(status_code=401, detail="MCP token expired")
     return payload
 
 
@@ -67,11 +96,11 @@ def expire_stale_mcp_tokens(conn) -> None:
     )
 
 
-def issue_mcp_token(conn, user, source_keys: list[str], bind_ip: bool, ip: str) -> dict[str, Any]:
+def issue_mcp_token(conn, user, source_keys: list[str], bind_ip: bool, ip: str, validity_period: str = "3m") -> dict[str, Any]:
     requested = sorted({str(item).strip() for item in source_keys if str(item).strip()})
+    period = normalize_validity_period(validity_period)
     issued_at = now_text()
-    exp_ts = int(time.time()) + MCP_TOKEN_TTL_SECONDS
-    expires_at = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d %H:%M:%S")
+    exp_ts, expires_at = expiry_for_validity_period(period)
     jti = secrets.token_hex(16)
     token = create_mcp_token(user, requested, bind_ip, ip, jti=jti, exp_ts=exp_ts)
     export_ip = str(ip or "").strip()
@@ -80,8 +109,8 @@ def issue_mcp_token(conn, user, source_keys: list[str], bind_ip: bool, ip: str) 
         INSERT INTO sys_mcp_token (
             jti, user_id, username, employee_no, department, source_keys_json,
             bind_ip, ip, token_hash, status, created_at, expires_at,
-            config_json, config_json_http
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, '', '')
+            config_json, config_json_http, validity_period
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, '', '', ?)
         """,
         (
             jti,
@@ -95,6 +124,7 @@ def issue_mcp_token(conn, user, source_keys: list[str], bind_ip: bool, ip: str) 
             hash_token_value(token),
             issued_at,
             expires_at,
+            period,
         ),
     )
     token_row = conn.execute("SELECT * FROM sys_mcp_token WHERE jti = ? LIMIT 1", (jti,)).fetchone()
@@ -108,6 +138,8 @@ def issue_mcp_token(conn, user, source_keys: list[str], bind_ip: bool, ip: str) 
         "ip": export_ip,
         "issued_at": issued_at,
         "expires_at": expires_at,
+        "validity_period": period,
+        "validity_label": validity_period_label(period),
     }
 
 
@@ -118,7 +150,7 @@ def update_mcp_token_configs(conn, token_id: int, config_json: str = "", config_
     )
 
 
-def validate_mcp_token_record(conn, token: str, payload: dict[str, Any]):
+def validate_mcp_token_record(conn, token: str, payload: dict[str, Any], source_key: str = ""):
     jti = str(payload.get("jti") or "").strip()
     if not jti:
         return None
@@ -133,6 +165,17 @@ def validate_mcp_token_record(conn, token: str, payload: dict[str, Any]):
         raise HTTPException(status_code=403, detail="MCP token has been disabled by admin")
     if status == "expired":
         raise HTTPException(status_code=401, detail="MCP token expired")
+    requested_source = str(source_key or "").strip()
+    if requested_source:
+        payload_sources = {str(item).strip() for item in payload.get("source_keys", []) if str(item).strip()}
+        record_sources = {str(item).strip() for item in parse_json_array(row["source_keys_json"]) if str(item).strip()}
+        if requested_source not in payload_sources or requested_source not in record_sources:
+            raise HTTPException(status_code=403, detail="MCP token has no access to this datasource")
+        user = conn.execute("SELECT * FROM sys_user WHERE id = ? LIMIT 1", (row["user_id"],)).fetchone()
+        if not user:
+            raise HTTPException(status_code=401, detail="MCP token user no longer exists")
+        if not has_source_permission(conn, user, requested_source):
+            raise HTTPException(status_code=403, detail="MCP token permission has been revoked")
     return row
 
 
@@ -153,6 +196,8 @@ def serialize_mcp_token_row(row) -> dict[str, Any]:
         "status": row["status"] or "active",
         "created_at": row["created_at"] or "",
         "expires_at": row["expires_at"] or "",
+        "validity_period": row.get("validity_period") or "3m",
+        "validity_label": validity_period_label(row.get("validity_period") or "3m"),
         "last_used_at": row["last_used_at"] or "",
         "last_used_ip": row["last_used_ip"] or "",
         "revoked_at": row["revoked_at"] or "",
@@ -183,4 +228,6 @@ def serialize_mcp_export_request_row(row) -> dict[str, Any]:
         "handled_by": row["handled_by"] or "",
         "admin_comment": row["admin_comment"] or "",
         "user_seen": bool(row["user_seen"]),
+        "validity_period": row.get("validity_period") or "3m",
+        "validity_label": validity_period_label(row.get("validity_period") or "3m"),
     }

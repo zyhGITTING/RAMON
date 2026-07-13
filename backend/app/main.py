@@ -79,16 +79,24 @@ def _bootstrap_postgres_admin() -> None:
         conn.close()
 
 
+def _table_column_exists(conn, table_name: str, column_name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ? LIMIT 1",
+        (table_name, column_name),
+    ).fetchone() is not None
+
+
 def _migrate_mcp_token_config_columns() -> None:
     conn = get_native_connection()
     try:
-        try:
-            conn.execute("ALTER TABLE sys_mcp_token ADD COLUMN IF NOT EXISTS config_json TEXT NOT NULL DEFAULT ''")
-            conn.execute("ALTER TABLE sys_mcp_token ADD COLUMN IF NOT EXISTS config_json_http TEXT NOT NULL DEFAULT ''")
-            conn.commit()
-            return
-        except Exception:
-            conn.rollback()
+        conn.execute("ALTER TABLE sys_mcp_token ADD COLUMN IF NOT EXISTS config_json TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE sys_mcp_token ADD COLUMN IF NOT EXISTS config_json_http TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE sys_mcp_token ADD COLUMN IF NOT EXISTS validity_period TEXT NOT NULL DEFAULT '3m'")
+        conn.execute("ALTER TABLE sys_mcp_export_request ADD COLUMN IF NOT EXISTS validity_period TEXT NOT NULL DEFAULT '3m'")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -96,31 +104,24 @@ def _migrate_mcp_token_config_columns() -> None:
 def _migrate_sync_interval_to_seconds() -> None:
     conn = get_native_connection()
     try:
-        try:
-            conn.execute("ALTER TABLE sys_datasource ADD COLUMN IF NOT EXISTS sync_interval_seconds INTEGER DEFAULT NULL")
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        try:
+        conn.execute("ALTER TABLE sys_datasource ADD COLUMN IF NOT EXISTS sync_interval_seconds INTEGER DEFAULT NULL")
+        if _table_column_exists(conn, "sys_datasource", "sync_interval_minutes"):
             conn.execute(
                 "UPDATE sys_datasource SET sync_interval_seconds = sync_interval_minutes * 60 "
                 "WHERE sync_interval_minutes IS NOT NULL AND COALESCE(sync_interval_seconds, 0) = 0"
             )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        try:
-            old_minutes = conn.execute("SELECT value FROM sys_config WHERE key = 'sync_interval_minutes' LIMIT 1").fetchone()
-            if old_minutes and old_minutes["value"]:
-                conn.execute(
-                    "INSERT INTO sys_config (key, value, updated_at) VALUES (?, ?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                    ("sync_interval_seconds", str(int(old_minutes["value"]) * 60), now_text()),
-                )
-                conn.execute("DELETE FROM sys_config WHERE key = 'sync_interval_minutes'")
-                conn.commit()
-        except Exception:
-            conn.rollback()
+        old_minutes = conn.execute("SELECT value FROM sys_config WHERE key = 'sync_interval_minutes' LIMIT 1").fetchone()
+        if old_minutes and old_minutes["value"]:
+            conn.execute(
+                "INSERT INTO sys_config (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                ("sync_interval_seconds", str(int(old_minutes["value"]) * 60), now_text()),
+            )
+            conn.execute("DELETE FROM sys_config WHERE key = 'sync_interval_minutes'")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -144,13 +145,12 @@ def _migrate_audit_log_enrichment_columns() -> None:
         ("accessed_fields", "TEXT DEFAULT ''"),
     ]
     try:
-        try:
-            for col, definition in new_columns:
-                conn.execute(f"ALTER TABLE sys_audit_log ADD COLUMN IF NOT EXISTS {col} {definition}")
-            conn.commit()
-            return
-        except Exception:
-            conn.rollback()
+        for col, definition in new_columns:
+            conn.execute(f"ALTER TABLE sys_audit_log ADD COLUMN IF NOT EXISTS {col} {definition}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

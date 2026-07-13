@@ -80,6 +80,7 @@ renderPlatform(); updateGlobalStatus();
     create_mcp_export_request: '申请 MCP 导出',
     handle_mcp_export_request: '审批 MCP 导出申请',
     revoke_mcp_token: '吊销 MCP 令牌',
+    update_mcp_token_expiry: '修改 MCP 有效期',
     revoke_mcp_token_self: '用户吊销 MCP 令牌',
     delete_mcp_token_self: '用户删除 MCP 令牌',
     view_api_doc: '查看接口文档',
@@ -262,6 +263,23 @@ renderPlatform(); updateGlobalStatus();
     el.textContent = msg; el.className = 'dm-toast show' + (isError?' error':'');
     clearTimeout(el._t); el._t = setTimeout(()=>{el.className='dm-toast';}, 2500);
   }
+  function copyTextFromSelector(selector, successMessage) {
+    const el = document.querySelector(selector);
+    const text = el ? el.textContent : '';
+    if (!text) {
+      showToast('\u6ca1\u6709\u53ef\u590d\u5236\u7684\u5185\u5bb9', true);
+      return;
+    }
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+      showToast('\u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u526a\u8d34\u677f\u590d\u5236', true);
+      return;
+    }
+    navigator.clipboard.writeText(text).then(
+      () => showToast(successMessage || '\u5df2\u590d\u5236\u5230\u526a\u8d34\u677f'),
+      () => showToast('\u590d\u5236\u5931\u8d25', true)
+    );
+  }
+  window.copyTextFromSelector = copyTextFromSelector;
 
   // ======== 登录状态更新 ========
   function updateLoginUI() {
@@ -1040,6 +1058,7 @@ renderPlatform(); updateGlobalStatus();
     _mcpApplySource = ds;
     $('dmMcpApplySourceName').textContent = `数据源：${ds.source_name}`;
     $('dmMcpApplyReason').value = '';
+    $('dmMcpApplyValidity').value = '3m';
     $('dmMcpApplyMask').classList.remove('dm-hidden');
   }
   $('dmMcpApplyClose').addEventListener('click', () => $('dmMcpApplyMask').classList.add('dm-hidden'));
@@ -1047,12 +1066,18 @@ renderPlatform(); updateGlobalStatus();
   $('dmMcpApplyMask').addEventListener('click', e => { if (e.target === $('dmMcpApplyMask')) $('dmMcpApplyMask').classList.add('dm-hidden'); });
   $('dmMcpApplySubmit').addEventListener('click', async () => {
     if (!_mcpApplySource) return;
+    const submitBtn = $('dmMcpApplySubmit');
+    if (submitBtn.disabled) return;
     const reason = ($('dmMcpApplyReason').value || '').trim();
+    const validityPeriod = $('dmMcpApplyValidity').value || '3m';
     if (reason.length < 2) { showToast('请填写至少 2 个字的申请原因', true); return; }
+    const oldLabel = submitBtn.textContent;
+    submitBtn.disabled = true;
+    submitBtn.textContent = '\u63d0\u4ea4\u4e2d...';
     try {
       const resp = await apiFetch('/api/mcp/export-request', {
         method: 'POST',
-        body: JSON.stringify({ source_key: _mcpApplySource.source_key, reason }),
+        body: JSON.stringify({ source_key: _mcpApplySource.source_key, reason, validity_period: validityPeriod }),
       });
       showToast(resp.message === 'Request already pending' ? '已有申请正在处理中' : '申请已提交，请等待管理员审批');
       $('dmMcpApplyMask').classList.add('dm-hidden');
@@ -1060,6 +1085,10 @@ renderPlatform(); updateGlobalStatus();
         refreshMcpApplyButtonState(_mcpApplySource.source_key);
       }
     } catch (e) { showToast(e.message, true); }
+    finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = oldLabel;
+    }
   });
 
   window.loadDetailData = async function(sourceKey, asOf='', syncVersion='') {
@@ -1268,6 +1297,28 @@ renderPlatform(); updateGlobalStatus();
     $('dmDsEditMask').classList.remove('dm-hidden');
   }
 
+  function datasourceEditHasChanges() {
+    if (!_currentDsEdit) return false;
+    const ds = _currentDsEdit;
+    const platformId = ds.platform_id ? String(ds.platform_id) : '';
+    return $('dmDeSourceName').value.trim() !== (ds.source_name || '') ||
+      $('dmDeMethod').value !== (ds.http_method || 'POST') ||
+      $('dmDeUrl').value.trim() !== (ds.api_url || '') ||
+      $('dmDePlatform').value !== platformId ||
+      $('dmDeDesc').value.trim() !== (ds.description || '') ||
+      $('dmDeSearchable').value !== (ds.searchable_fields || []).join(', ') ||
+      $('dmDeQualityRules').value !== prettyJson(ds.quality_rules || {}) ||
+      $('dmDeVerifyTls').checked !== !!ds.verify_tls ||
+      $('dmDeReqCfg').value !== prettyJson(ds.request_config || {}) ||
+      $('dmDeRespCfg').value !== prettyJson(ds.response_config || {}) ||
+      $('dmDeToken').value.trim() !== '';
+  }
+
+  function closeDatasourceEditModal(force) {
+    if (!force && datasourceEditHasChanges() && !confirm('\u7f16\u8f91\u5185\u5bb9\u8fd8\u6ca1\u6709\u4fdd\u5b58\uff0c\u786e\u8ba4\u5173\u95ed\u5417\uff1f')) return;
+    $('dmDsEditMask').classList.add('dm-hidden');
+  }
+
   function closeDatasourceDeleteModal() {
     $('dmDsDeleteMask').classList.add('dm-hidden');
     $('dmDsDeletePassword').value = '';
@@ -1283,9 +1334,9 @@ renderPlatform(); updateGlobalStatus();
     setTimeout(() => $('dmDsDeletePassword').focus(), 0);
   }
 
-  $('dmDsEditClose').addEventListener('click', () => $('dmDsEditMask').classList.add('dm-hidden'));
-  $('dmDeCancel').addEventListener('click', () => $('dmDsEditMask').classList.add('dm-hidden'));
-  $('dmDsEditMask').addEventListener('click', e => { if (e.target === $('dmDsEditMask')) $('dmDsEditMask').classList.add('dm-hidden'); });
+  $('dmDsEditClose').addEventListener('click', () => closeDatasourceEditModal(false));
+  $('dmDeCancel').addEventListener('click', () => closeDatasourceEditModal(false));
+  $('dmDsEditMask').addEventListener('click', e => { if (e.target === $('dmDsEditMask')) closeDatasourceEditModal(false); });
   $('dmDeTokenToggle').addEventListener('click', () => {
     const input = $('dmDeToken');
     const show = input.type === 'password';
@@ -1314,7 +1365,7 @@ renderPlatform(); updateGlobalStatus();
       });
       showToast(resp.message || '数据源已删除');
       closeDatasourceDeleteModal();
-      $('dmDsEditMask').classList.add('dm-hidden');
+      closeDatasourceEditModal(true);
       await loadDynamicPlatforms();
       renderAdminDatasources();
     } catch (e) {
@@ -1348,7 +1399,7 @@ renderPlatform(); updateGlobalStatus();
     try {
       await apiFetch('/api/admin/datasource/' + _currentDsEdit.id, {method:'PUT', body: JSON.stringify(body)});
       showToast('保存成功');
-      $('dmDsEditMask').classList.add('dm-hidden');
+      closeDatasourceEditModal(true);
       await loadDynamicPlatforms();
       // 如果当前在数据源管理页，也刷新
       if (currentAdminView === 'datasources') await renderAdminDatasources();
@@ -1396,7 +1447,7 @@ renderPlatform(); updateGlobalStatus();
           <pre style="color:#334155;font-size:11px;margin:0;white-space:pre-wrap;word-break:break-all;">${escapeHtml(data.config_json)}</pre>
         </div>
         <div style="margin-top:12px;display:flex;gap:8px;">
-          <button class="dm-btn primary" onclick="navigator.clipboard.writeText(document.querySelector('#dmMcpBody pre').textContent);showToast('已复制到剪贴板')">复制 JSON</button>
+          <button class="dm-btn primary" onclick="copyTextFromSelector('#dmMcpBody pre','已复制到剪贴板')">复制 JSON</button>
         </div>`;
     } catch(err) {
       $('dmMcpBody').innerHTML = `
@@ -1430,7 +1481,7 @@ renderPlatform(); updateGlobalStatus();
           <pre style="color:#334155;font-size:11px;margin:0;white-space:pre-wrap;word-break:break-all;">${escapeHtml(data.config_json)}</pre>
         </div>
         <div style="margin-top:12px;display:flex;gap:8px;">
-          <button class="dm-btn primary" onclick="navigator.clipboard.writeText(document.querySelector('#dmMcpBody pre').textContent);showToast('已复制到剪贴板')">复制 JSON</button>
+          <button class="dm-btn primary" onclick="copyTextFromSelector('#dmMcpBody pre','已复制到剪贴板')">复制 JSON</button>
         </div>`;
     } catch(err) {
       $('dmMcpBody').innerHTML = `
@@ -1463,7 +1514,7 @@ renderPlatform(); updateGlobalStatus();
         <div style="margin-bottom:12px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
             <span style="font-size:12px;font-weight:600;color:#334155;">SSE 配置</span>
-            <button class="dm-btn primary" onclick="navigator.clipboard.writeText(document.querySelector('#mcpOriginalSse').textContent);showToast('SSE 配置已复制')">复制 SSE</button>
+            <button class="dm-btn primary" onclick="copyTextFromSelector('#mcpOriginalSse','SSE 配置已复制')">复制 SSE</button>
           </div>
           <div style="border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;padding:14px;overflow:auto;max-height:260px;">
             <pre id="mcpOriginalSse" style="color:#334155;font-size:11px;margin:0;white-space:pre-wrap;word-break:break-all;">${escapeHtml(data.config_json)}</pre>
@@ -1473,7 +1524,7 @@ renderPlatform(); updateGlobalStatus();
         <div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
             <span style="font-size:12px;font-weight:600;color:#334155;">HTTP (Streamable HTTP) 配置</span>
-            <button class="dm-btn primary" onclick="navigator.clipboard.writeText(document.querySelector('#mcpOriginalHttp').textContent);showToast('HTTP 配置已复制')">复制 HTTP</button>
+            <button class="dm-btn primary" onclick="copyTextFromSelector('#mcpOriginalHttp','HTTP 配置已复制')">复制 HTTP</button>
           </div>
           <div style="border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;padding:14px;overflow:auto;max-height:260px;">
             <pre id="mcpOriginalHttp" style="color:#334155;font-size:11px;margin:0;white-space:pre-wrap;word-break:break-all;">${escapeHtml(data.config_json_http)}</pre>
@@ -2623,6 +2674,7 @@ renderPlatform(); updateGlobalStatus();
               <td style="white-space:normal;min-width:170px;">
                 <div style="font-size:11px;color:#0f172a;">创建: ${escapeHtml(item.created_at || '-')}</div>
                 <div style="font-size:11px;color:#64748b;">到期: ${escapeHtml(item.expires_at || '-')}</div>
+                <div style="font-size:11px;color:#94a3b8;">有效期: ${escapeHtml(item.validity_label || item.validity_period || '-')}</div>
               </td>
               <td style="white-space:normal;min-width:170px;">
                 <div style="font-size:11px;color:#0f172a;">${escapeHtml(item.last_used_at || '从未使用')}</div>
@@ -2636,8 +2688,8 @@ renderPlatform(); updateGlobalStatus();
               <td>
                 <div style="display:flex;gap:6px;flex-wrap:wrap;">
                   <button class="dm-tbl-btn" data-mcp-view="${item.id}">查看原文</button>
-                  ${item.status === 'active'
-                    ? `<button class="dm-tbl-btn danger" data-mcp-revoke="${item.id}" data-mcp-user="${escapeHtml(item.username || '')}">停用</button>`
+                  ${item.status === 'active' || item.status === 'expired'
+                    ? `<button class="dm-tbl-btn" data-mcp-expiry="${item.id}" data-mcp-validity="${escapeHtml(item.validity_period || '3m')}">改有效期</button>${item.status === 'active' ? `<button class="dm-tbl-btn danger" data-mcp-revoke="${item.id}" data-mcp-user="${escapeHtml(item.username || '')}">停用</button>` : ''}`
                     : '<span style="font-size:11px;color:#94a3b8;">-</span>'}
                 </div>
               </td>
@@ -2668,6 +2720,24 @@ renderPlatform(); updateGlobalStatus();
       btn.addEventListener('click', ()=>{
         const tokenId = parseInt(btn.dataset.mcpView, 10);
         viewMcpOriginal(tokenId, true);
+      });
+    });
+    document.querySelectorAll('[data-mcp-expiry]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        const tokenId = parseInt(btn.dataset.mcpExpiry, 10);
+        const current = btn.dataset.mcpValidity || '3m';
+        const choice = prompt('修改 MCP 有效期：输入 3、6 或 permanent\n\n3 = 3个月\n6 = 6个月\npermanent = 永久', current === '6m' ? '6' : (current === 'permanent' ? 'permanent' : '3'));
+        if (choice === null) return;
+        const normalized = choice.trim().toLowerCase();
+        const validity = normalized === '6' || normalized === '6m' ? '6m' : (normalized === 'permanent' || normalized === '永久' ? 'permanent' : '3m');
+        try {
+          const resp = await apiFetch('/api/admin/mcp-token/' + tokenId + '/expiry', {
+            method:'POST',
+            body: JSON.stringify({validity_period: validity}),
+          });
+          showToast(resp.message || 'MCP 有效期已更新');
+          await renderAdminMcp();
+        } catch (e) { showToast(e.message, true); }
       });
     });
     document.querySelectorAll('[data-mcp-revoke]').forEach(btn=>{
@@ -2731,7 +2801,10 @@ renderPlatform(); updateGlobalStatus();
           <tbody>${requests.map(item => `
             <tr>
               <td style="white-space:normal;min-width:150px;">${escapeHtml(item.source_name || item.source_key || '-')}</td>
-              <td style="white-space:normal;min-width:220px;font-size:12px;color:#334155;">${escapeHtml(item.reason || '-')}</td>
+              <td style="white-space:normal;min-width:220px;font-size:12px;color:#334155;">
+                <div>${escapeHtml(item.reason || '-')}</div>
+                <div style="font-size:11px;color:#94a3b8;margin-top:4px;">有效期: ${escapeHtml(item.validity_label || item.validity_period || '-')}</div>
+              </td>
               <td style="white-space:normal;min-width:140px;font-size:11px;color:#64748b;">${escapeHtml(item.created_at || '-')}</td>
               <td><span style="font-size:11px;padding:2px 8px;border-radius:999px;background:#fef9c3;color:#854d0e;">申请中</span></td>
             </tr>`).join('')}
@@ -2756,6 +2829,7 @@ renderPlatform(); updateGlobalStatus();
               <td style="white-space:normal;min-width:180px;">
                 <div style="font-size:11px;color:#0f172a;">创建: ${escapeHtml(item.created_at || '-')}</div>
                 <div style="font-size:11px;color:#64748b;">到期: ${escapeHtml(item.expires_at || '-')}</div>
+                <div style="font-size:11px;color:#94a3b8;">有效期: ${escapeHtml(item.validity_label || item.validity_period || '-')}</div>
               </td>
               <td style="white-space:normal;min-width:180px;">
                 <div style="font-size:11px;color:#0f172a;">${escapeHtml(item.last_used_at || '从未使用')}</div>
@@ -2839,7 +2913,10 @@ renderPlatform(); updateGlobalStatus();
           <tbody>${items.length ? items.map(item => `
             <tr>
               <td style="white-space:normal;min-width:150px;">${escapeHtml(item.source_name || item.source_key || '-')}</td>
-              <td style="white-space:normal;min-width:200px;font-size:12px;color:#334155;">${escapeHtml(item.reason || '-')}</td>
+              <td style="white-space:normal;min-width:200px;font-size:12px;color:#334155;">
+                <div>${escapeHtml(item.reason || '-')}</div>
+                <div style="font-size:11px;color:#94a3b8;margin-top:4px;">有效期: ${escapeHtml(item.validity_label || item.validity_period || '-')}</div>
+              </td>
               <td style="white-space:normal;min-width:140px;font-size:11px;color:#64748b;">${escapeHtml(item.created_at || '-')}</td>
               <td>${_mcpReqStatusBadge(item.status)}</td>
               <td style="white-space:normal;min-width:200px;font-size:11px;color:#64748b;">
@@ -2940,7 +3017,10 @@ renderPlatform(); updateGlobalStatus();
                 <div style="font-size:11px;color:#64748b;">工号: ${escapeHtml(item.employee_no || '-')} · 部门: ${escapeHtml(item.department || '-')}</div>
               </td>
               <td style="white-space:normal;min-width:150px;">${escapeHtml(item.source_name || item.source_key || '-')}</td>
-              <td style="white-space:normal;min-width:220px;font-size:12px;color:#334155;">${escapeHtml(item.reason || '-')}</td>
+              <td style="white-space:normal;min-width:220px;font-size:12px;color:#334155;">
+                <div>${escapeHtml(item.reason || '-')}</div>
+                <div style="font-size:11px;color:#94a3b8;margin-top:4px;">有效期: ${escapeHtml(item.validity_label || item.validity_period || '-')}</div>
+              </td>
               <td style="white-space:normal;min-width:140px;font-size:11px;color:#64748b;">${escapeHtml(item.created_at || '-')}</td>
               <td style="white-space:normal;min-width:150px;">
                 ${statusBadge(item.status)}

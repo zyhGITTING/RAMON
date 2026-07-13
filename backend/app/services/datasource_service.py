@@ -14,8 +14,9 @@ from backend.app.services.permission_service import (
 
 RAMON_AUTH_ENV_VAR = "DATAMID_RAMON_AUTH"
 DEFAULT_RAMON_AUTH = os.getenv(RAMON_AUTH_ENV_VAR, "").strip()
-OFFICIAL_SOURCE_KEYS = {"erp_buy", "stock", "srm_purchase"}
+OFFICIAL_SOURCE_KEYS = {"erp_buy", "stock", "erp_safe_stock", "srm_purchase"}
 DEFAULT_SYNC_PAGE_SIZE = max(1, int(os.getenv("DATAMID_SYNC_PAGE_SIZE", os.getenv("DATAMID_SYNC_ROW_LIMIT", "300"))))
+ODS_VERSION_RETENTION_COUNT = 20
 
 STANDARD_FIELD_CATALOG: dict[str, dict[str, str]] = {
     "purchase_request_code": {"standard_field_name": "请购单号", "business_domain": "procurement", "entity_code": "purchase_request", "entity_role": "identifier", "metric_unit": "", "definition": "跨系统统一的请购单主编号"},
@@ -91,6 +92,21 @@ SOURCE_STANDARD_FIELD_MAP: dict[str, dict[str, str]] = {
         "sum_qty_on_prc": "in_production_quantity",
         "need_days": "coverage_days",
         "createdate": "snapshot_date",
+    },
+    "erp_safe_stock": {
+        "prd_no": "material_code",
+        "prd_name": "material_name",
+        "prd_spc": "material_model",
+        "prd_snm": "material_short_name",
+        "indx_name": "inventory_category",
+        "abc": "abc_class",
+        "moren_cangku_mc": "warehouse_name",
+        "xianyou_kucun": "inventory_on_hand",
+        "qty_min": "safety_stock_quantity",
+        "kucu_queliang": "shortage_quantity",
+        "sum_qty_on_way": "in_transit_quantity",
+        "sum_qty_on_prc": "in_production_quantity",
+        "need_days": "coverage_days",
     },
     "srm_purchase": {
         "po_code": "purchase_order_code",
@@ -194,6 +210,45 @@ def build_default_datasources() -> list[dict[str, Any]]:
             "searchable_fields": ["prd_no", "prd_name", "prd_spc", "prd_snm", "indx_name"],
             "quality_rules": {"row_count_change": {"warn_ratio": 0.8}},
             "request": request_cfg({"compno": erp_compno, "page": "$page", "page_size": "$page_size"}),
+            "response": {},
+        },
+        {
+            "source_key": "erp_safe_stock",
+            "source_name": "物料安全库存不足预警",
+            "table_name": "ods_erp_safe_stock",
+            "platform_name": "ERP",
+            "http_method": "POST",
+            "api_url": os.getenv("DATAMID_ERP_SAFE_STOCK_URL", "").strip(),
+            "description": "ERP 物料安全库存、现有库存与缺口预警",
+            "chart_field": "indx_name",
+            "field_labels": {
+                "id": "主键ID",
+                "prd_no": "品号",
+                "prd_name": "品名",
+                "prd_snm": "简称",
+                "prd_spc": "型号",
+                "abc": "ABC分类",
+                "knd": "大类",
+                "idx1": "中类代码",
+                "indx_name": "中类名称",
+                "need_days": "前置天数",
+                "zuixiao_caigouliang": "最小采购量",
+                "cgdl": "采购大类",
+                "cgxl": "采购小类",
+                "sum_qty_on_way": "在途量",
+                "sum_qty_on_prc": "在制量",
+                "sum_qty_on_rsv": "未发预占量",
+                "ck_cishu": "盘点周转次数",
+                "qty_min": "安全库存",
+                "moren_cangku_bh": "默认仓库编码",
+                "moren_cangku_mc": "默认仓库名称",
+                "anquankucun_lx": "安全库存类型",
+                "xianyou_kucun": "现有库存",
+                "kucu_queliang": "库存缺量",
+            },
+            "searchable_fields": ["prd_no", "prd_name", "prd_spc", "prd_snm", "indx_name"],
+            "quality_rules": {"row_count_change": {"warn_ratio": 0.8}},
+            "request": request_cfg({"page": "$page", "page_size": "$page_size"}),
             "response": {},
         },
         {
@@ -366,6 +421,18 @@ def sanitize_request_config(source_key: str, request_config: dict[str, Any], tok
         headers["Authorization"] = existing_auth
     payload["headers"] = headers
     payload["pagination"] = normalize_pagination_config(payload.get("pagination"))
+    return payload
+
+
+def redact_request_config_for_response(request_config: dict[str, Any]) -> dict[str, Any]:
+    payload = json.loads(json.dumps(request_config or {}, ensure_ascii=False))
+    headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
+    redacted_headers = {str(key): value for key, value in headers.items() if str(key).lower() != "authorization"}
+    if redacted_headers:
+        payload["headers"] = redacted_headers
+    else:
+        payload.pop("headers", None)
+    payload.pop("requires_auth_env", None)
     return payload
 
 
@@ -739,6 +806,9 @@ def serialize_datasource(conn, datasource, user) -> dict[str, Any]:
     config = parse_datasource_config(datasource)
     request_config = config.get("request") if isinstance(config.get("request"), dict) else {}
     request_config = sanitize_request_config(datasource["source_key"], request_config)
+    is_admin = user is not None and user["role"] == "admin"
+    has_token = bool(DEFAULT_RAMON_AUTH) if datasource["source_key"] in OFFICIAL_SOURCE_KEYS else bool((request_config.get("headers") or {}).get("Authorization"))
+    response_request_config = request_config if is_admin else redact_request_config_for_response(request_config)
     platform_name = None
     if datasource["platform_id"]:
         platform = conn.execute("SELECT name FROM sys_platform WHERE id = ? LIMIT 1", (datasource["platform_id"],)).fetchone()
@@ -770,7 +840,7 @@ def serialize_datasource(conn, datasource, user) -> dict[str, Any]:
         "source_name": datasource["source_name"],
         "table_name": datasource["table_name"],
         "http_method": datasource["http_method"],
-        "api_url": datasource["api_url"] or "",
+        "api_url": (datasource["api_url"] or "") if is_admin else "",
         "platform_id": datasource["platform_id"],
         "platform_name": platform_name,
         "description": config.get("description", ""),
@@ -787,12 +857,12 @@ def serialize_datasource(conn, datasource, user) -> dict[str, Any]:
         "last_quality_report": datasource["last_quality_report"] or "",
         "searchable_fields": config.get("searchable_fields", []),
         "quality_rules": config.get("quality_rules", {}),
-        "request_config": request_config,
+        "request_config": response_request_config,
         "response_config": config.get("response", {}),
         "verify_tls": bool(config.get("verify_tls", True)),
         "has_permission": has_perm,
         "permission_origin": resolve_permission_origin(conn, user, datasource["source_key"]),
-        "has_token": bool(DEFAULT_RAMON_AUTH) if datasource["source_key"] in OFFICIAL_SOURCE_KEYS else bool((request_config.get("headers") or {}).get("Authorization")),
+        "has_token": has_token,
         "enabled": int(datasource["enabled"]),
         "technical": {"table_name": datasource["table_name"], "http_method": datasource["http_method"]},
     }
@@ -870,3 +940,43 @@ def replace_ods_table_rows(conn, table_name: str, rows: list[dict[str, Any]], sy
     sql = f"INSERT INTO {_quote_identifier(table_name)} ({', '.join(_quote_identifier(c) for c in columns)}) VALUES ({placeholders})"
     synced_at = now_text()
     conn.executemany(sql, [[sync_batch_id, synced_at, sync_version, 1, *[row.get(column, "") for column in business_columns]] for row in normalized_rows])
+
+
+def prune_ods_table_versions(conn, source_key: str, table_name: str, keep_versions: int = ODS_VERSION_RETENTION_COUNT) -> int:
+    if keep_versions <= 0 or not table_exists(conn, table_name) or not has_table_column(conn, table_name, "sync_version"):
+        return 0
+    keep_rows = conn.execute(
+        """
+        SELECT sync_version
+        FROM sys_sync_version
+        WHERE source_key = ?
+          AND status IN ('success', 'warning', 'empty')
+          AND COALESCE(sync_version, '') != ''
+        ORDER BY CASE WHEN is_current = 1 THEN 0 ELSE 1 END, finished_at DESC, id DESC
+        LIMIT ?
+        """,
+        (source_key, keep_versions),
+    ).fetchall()
+    keep_set = {str(row["sync_version"]) for row in keep_rows if str(row["sync_version"] or "").strip()}
+    if not keep_set:
+        return 0
+    old_rows = conn.execute(
+        """
+        SELECT sync_version
+        FROM sys_sync_version
+        WHERE source_key = ?
+          AND status IN ('success', 'warning', 'empty')
+          AND COALESCE(sync_version, '') != ''
+        """,
+        (source_key,),
+    ).fetchall()
+    old_versions = sorted({str(row["sync_version"]) for row in old_rows if str(row["sync_version"] or "").strip() and str(row["sync_version"]) not in keep_set})
+    if not old_versions:
+        return 0
+    placeholders = ", ".join(["?"] * len(old_versions))
+    conn.execute(f"DELETE FROM {_quote_identifier(table_name)} WHERE sync_version IN ({placeholders})", old_versions)
+    conn.execute(
+        f"DELETE FROM sys_sync_version WHERE source_key = ? AND sync_version IN ({placeholders})",
+        [source_key, *old_versions],
+    )
+    return len(old_versions)

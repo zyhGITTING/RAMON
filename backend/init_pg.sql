@@ -223,7 +223,8 @@ CREATE TABLE IF NOT EXISTS sys_mcp_token (
     deleted_by        TEXT NOT NULL DEFAULT '',
     deleted_reason    TEXT NOT NULL DEFAULT '',
     config_json       TEXT NOT NULL DEFAULT '',
-    config_json_http  TEXT NOT NULL DEFAULT ''
+    config_json_http  TEXT NOT NULL DEFAULT '',
+    validity_period   TEXT NOT NULL DEFAULT '3m'
 );
 CREATE INDEX IF NOT EXISTS idx_sys_mcp_token_status ON sys_mcp_token(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sys_mcp_token_user ON sys_mcp_token(user_id, created_at DESC);
@@ -242,7 +243,8 @@ CREATE TABLE IF NOT EXISTS sys_mcp_export_request (
     handled_at      TEXT NOT NULL DEFAULT '',
     handled_by      TEXT NOT NULL DEFAULT '',
     admin_comment   TEXT NOT NULL DEFAULT '',
-    user_seen       INTEGER NOT NULL DEFAULT 0
+    user_seen       INTEGER NOT NULL DEFAULT 0,
+    validity_period TEXT NOT NULL DEFAULT '3m'
 );
 CREATE INDEX IF NOT EXISTS idx_sys_mcp_export_request_status ON sys_mcp_export_request(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sys_mcp_export_request_user ON sys_mcp_export_request(user_id, source_key, created_at DESC);
@@ -263,4 +265,8 @@ VALUES
     ('erp_buy',      'ERP采购请购',   'ods_erp_buy',       'POST', 1),
     ('stock',        '库存预警',      'ods_stock',         'POST', 1),
     ('srm_purchase', 'SRM采购需求',   'ods_srm_purchase',  'POST', 1)
+ON CONFLICT (source_key) DO NOTHING;
+
+INSERT INTO sys_datasource (source_key, source_name, table_name, http_method, enabled)
+VALUES ('erp_safe_stock', 'ERP safe stock', 'ods_erp_safe_stock', 'POST', 1)
 ON CONFLICT (source_key) DO NOTHING;

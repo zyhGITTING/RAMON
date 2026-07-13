@@ -157,6 +157,7 @@ def _handle_mcp_jsonrpc(
     if method == "tools/list":
         conn = get_connection()
         try:
+            validate_mcp_token_record(conn, raw_token, payload, source_key)
             datasource = get_datasource_detail(conn, source_key)
             if not datasource:
                 return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "Datasource not found"}}
@@ -176,7 +177,7 @@ def _handle_mcp_jsonrpc(
         arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         conn = get_connection()
         try:
-            token_row = validate_mcp_token_record(conn, raw_token, payload)
+            token_row = validate_mcp_token_record(conn, raw_token, payload, source_key)
             datasource = get_datasource_detail(conn, source_key)
             if not datasource:
                 return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "Datasource not found"}}
@@ -278,7 +279,7 @@ def api_mcp_data(
     ip = resolve_client_ip(request)
     conn = get_connection()
     try:
-        token_row = validate_mcp_token_record(conn, raw_token, payload)
+        token_row = validate_mcp_token_record(conn, raw_token, payload, source_key)
         datasource = get_datasource_detail(conn, source_key)
         if not datasource:
             raise HTTPException(status_code=404, detail="Datasource not found")
@@ -340,6 +341,7 @@ def api_mcp_data(
 _SSE_SESSIONS: dict[str, dict[str, Any]] = {}
 _SSE_LOCK = threading.Lock()
 _SSE_SESSION_TTL_SECONDS = 300
+_SSE_HEARTBEAT_SECONDS = 30
 
 
 def _authenticate_mcp_token_query(request: Request, source_key: str) -> tuple[str, dict[str, Any]]:
@@ -389,6 +391,13 @@ def _close_sse_session(session_id: str) -> None:
         _SSE_SESSIONS.pop(session_id, None)
 
 
+def _touch_sse_session(session_id: str) -> None:
+    with _SSE_LOCK:
+        sess = _SSE_SESSIONS.get(session_id)
+        if sess is not None:
+            sess["last_active"] = time.time()
+
+
 def _sse_event(event: str | None, data: Any) -> str:
     lines: list[str] = []
     if event:
@@ -400,6 +409,10 @@ def _sse_event(event: str | None, data: Any) -> str:
     lines.append("")
     lines.append("")
     return "\n".join(lines)
+
+
+def _sse_heartbeat() -> str:
+    return ": keep-alive\n\n"
 
 
 def _sse_cleanup_loop() -> None:
@@ -427,6 +440,11 @@ def api_mcp_sse(
 ) -> StreamingResponse:
     """MCP SSE 传输端点。"""
     raw_token, payload = _authenticate_mcp_token_query(request, source_key)
+    conn = get_connection()
+    try:
+        validate_mcp_token_record(conn, raw_token, payload, source_key)
+    finally:
+        conn.close()
     session_id, q = _create_sse_session(source_key, raw_token, payload)
 
     endpoint_url = f"{PUBLIC_URL}/api/mcp/message/{source_key}?session_id={session_id}&mcp_token={raw_token}"
@@ -437,11 +455,14 @@ def api_mcp_sse(
             yield _sse_event("endpoint", endpoint_url).encode("utf-8")
             while True:
                 try:
-                    msg = q.get(timeout=_SSE_SESSION_TTL_SECONDS)
+                    msg = q.get(timeout=_SSE_HEARTBEAT_SECONDS)
                 except queue.Empty:
-                    break
+                    _touch_sse_session(session_id)
+                    yield _sse_heartbeat().encode("utf-8")
+                    continue
                 if msg is None:
                     break
+                _touch_sse_session(session_id)
                 yield _sse_event("message", msg).encode("utf-8")
         finally:
             _close_sse_session(session_id)

@@ -185,6 +185,14 @@
         <span>申请原因</span>
         <textarea id="dmMcpApplyReason" rows="4" placeholder="请说明申请该数据源 MCP 导出权限的原因" style="width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:13px;resize:vertical;box-sizing:border-box;"></textarea>
       </label>
+      <label style="display:flex;flex-direction:column;gap:6px;font-size:13px;color:#334155;margin-top:12px;">
+        <span>有效期</span>
+        <select id="dmMcpApplyValidity" class="dm-input">
+          <option value="3m">3个月</option>
+          <option value="6m">6个月</option>
+          <option value="permanent">永久</option>
+        </select>
+      </label>
       <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end;">
         <button class="dm-btn" id="dmMcpApplyCancel" type="button">取消</button>
         <button class="dm-btn primary" id="dmMcpApplySubmit" type="button">提交申请</button>

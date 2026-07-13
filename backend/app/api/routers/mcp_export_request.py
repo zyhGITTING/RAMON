@@ -10,7 +10,7 @@ from backend.app.db.repositories.audit import record_audit_log
 from backend.app.schemas.mcp import McpExportApplyRequest, McpExportRequestHandleRequest
 from backend.app.services.auth_service import resolve_client_ip
 from backend.app.services.datasource_service import get_datasource_detail
-from backend.app.services.mcp_service import now_text, serialize_mcp_export_request_row
+from backend.app.services.mcp_service import normalize_validity_period, now_text, serialize_mcp_export_request_row
 from backend.app.services.permission_service import has_source_permission
 
 router = APIRouter()
@@ -20,6 +20,7 @@ router = APIRouter()
 def api_mcp_export_request_create(request: Request, payload: McpExportApplyRequest, user=Depends(get_current_user)) -> dict[str, Any]:
     source_key = payload.source_key.strip()
     reason = payload.reason.strip()
+    validity_period = normalize_validity_period(payload.validity_period)
     if not source_key:
         raise HTTPException(status_code=400, detail="source_key is required")
     if len(reason) < 2:
@@ -43,8 +44,9 @@ def api_mcp_export_request_create(request: Request, payload: McpExportApplyReque
             """
             INSERT INTO sys_mcp_export_request (
                 user_id, username, employee_no, department, source_key, source_name,
-                reason, status, created_at, handled_at, handled_by, admin_comment
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', '', '')
+                reason, status, created_at, handled_at, handled_by, admin_comment,
+                validity_period
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', '', '', ?)
             """,
             (
                 user["id"],
@@ -55,6 +57,7 @@ def api_mcp_export_request_create(request: Request, payload: McpExportApplyReque
                 datasource["source_name"] or source_key,
                 reason,
                 created_at,
+                validity_period,
             ),
         )
         row = conn.execute("SELECT * FROM sys_mcp_export_request ORDER BY id DESC LIMIT 1").fetchone()
@@ -66,7 +69,7 @@ def api_mcp_export_request_create(request: Request, payload: McpExportApplyReque
         user["role"],
         "create_mcp_export_request",
         "sys_mcp_export_request",
-        f"source_key={source_key};reason={reason}",
+        f"source_key={source_key};validity_period={validity_period};reason={reason}",
         client_ip,
     )
     return {"message": "Request submitted", "request": serialize_mcp_export_request_row(row)}

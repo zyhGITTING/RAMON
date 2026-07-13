@@ -18,7 +18,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from backend.app.db.connection import get_connection
 
 TOKEN_TTL_SECONDS = int(os.getenv("DATAMID_TOKEN_TTL_SECONDS", "43200"))
-TOKEN_SECRET = os.getenv("DATAMID_TOKEN_SECRET", "change-me-in-production")
+TOKEN_SECRET = os.getenv("DATAMID_TOKEN_SECRET", "").strip()
+ALLOW_INSECURE_TOKEN_SECRET = os.getenv("DATAMID_ALLOW_INSECURE_TOKEN_SECRET", "").strip().lower() in {"1", "true", "yes", "on"}
+if TOKEN_SECRET in {"", "change-me-in-production"} or len(TOKEN_SECRET) < 32:
+    if not ALLOW_INSECURE_TOKEN_SECRET:
+        raise RuntimeError("DATAMID_TOKEN_SECRET must be a random string with at least 32 characters")
+    TOKEN_SECRET = TOKEN_SECRET or "dev-only-insecure-token-secret-do-not-use"
 LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("DATAMID_LOGIN_RATE_WINDOW_SECONDS", "300"))
 LOGIN_RATE_MAX_ATTEMPTS = int(os.getenv("DATAMID_LOGIN_RATE_MAX_ATTEMPTS", "5"))
 ALLOW_SELF_REGISTER = os.getenv("DATAMID_ALLOW_SELF_REGISTER", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -181,7 +186,7 @@ def _sign_payload(payload: dict[str, Any]) -> str:
     return f"{body_b64}.{sig_b64}"
 
 
-def _decode_signed_token(token: str) -> dict[str, Any]:
+def _decode_signed_token(token: str, *, verify_exp: bool = True) -> dict[str, Any]:
     try:
         body_b64, sig_b64 = token.split(".", 1)
     except ValueError as exc:
@@ -193,7 +198,7 @@ def _decode_signed_token(token: str) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid token")
     body_raw = base64.urlsafe_b64decode(body_b64 + "=" * (-len(body_b64) % 4))
     payload = json.loads(body_raw.decode("utf-8"))
-    if int(payload.get("exp", 0)) < int(time.time()):
+    if verify_exp and int(payload.get("exp", 0)) < int(time.time()):
         raise HTTPException(status_code=401, detail="Token expired")
     return payload
 

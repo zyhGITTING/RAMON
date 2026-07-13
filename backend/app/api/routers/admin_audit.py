@@ -43,6 +43,7 @@ _AUDIT_ACTION_LABELS = {
     "create_mcp_export_request": "申请 MCP 导出",
     "handle_mcp_export_request": "审批 MCP 导出申请",
     "revoke_mcp_token": "吊销 MCP 令牌",
+    "update_mcp_token_expiry": "修改 MCP 有效期",
     "revoke_mcp_token_self": "用户吊销 MCP 令牌",
     "delete_mcp_token_self": "用户删除 MCP 令牌",
     "change_password": "修改密码",
