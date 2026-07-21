@@ -1,5 +1,5 @@
 -- 添加 ERP 物料安全库存不足预警数据源
--- 执行方式：docker exec -i datamid-pg psql -U datamid -d datamid < add_erp_safe_stock.sql
+-- 执行方式：docker exec -i datamid-pg psql -U datamid_app -d datamid < add_erp_safe_stock.sql
 
 -- 1. 确保 ERP 平台存在
 INSERT INTO sys_platform (name, description, created_at, sort_order)

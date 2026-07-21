@@ -27,6 +27,7 @@ _AUDIT_ACTION_LABELS = {
     "set_user_field_permissions": "设置用户字段权限",
     "set_department_field_permissions": "设置部门字段权限",
     "set_field_restriction": "设置字段限制",
+    "update_field_metadata": "维护字段标准",
     "create_platform": "创建平台",
     "update_platform": "更新平台",
     "delete_platform": "删除平台",
@@ -50,16 +51,27 @@ _AUDIT_ACTION_LABELS = {
 }
 
 
+_AUDIT_ACTION_LABELS.update({
+    "mcp_token_rejected": "MCP 令牌被拒绝",
+    "mcp_anomaly_detected": "MCP 异常调用",
+})
+
+
 @router.api_route("/api/admin/audit-log", methods=["GET", "POST"])
-def admin_audit_log(keyword: str = "", page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=200), admin=Depends(require_admin)) -> dict[str, Any]:
+def admin_audit_log(keyword: str = "", jti: str = "", page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=200), admin=Depends(require_admin)) -> dict[str, Any]:
     conn = get_connection()
     try:
-        kw = keyword.strip()
-        where = ""
+        where_parts: list[str] = []
         params: list[Any] = []
+        kw = keyword.strip()
         if kw:
-            where = " WHERE username LIKE ? OR action LIKE ? OR target LIKE ? OR detail LIKE ? OR ip LIKE ?"
+            where_parts.append("(username LIKE ? OR action LIKE ? OR target LIKE ? OR detail LIKE ? OR ip LIKE ?)")
             params.extend([f"%{kw}%"] * 5)
+        jti_value = jti.strip()
+        if jti_value:
+            where_parts.append("jti = ?")
+            params.append(jti_value)
+        where = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
         total = int(conn.execute(f"SELECT COUNT(*) AS c FROM sys_audit_log{where}", params).fetchone()["c"])
         rows = conn.execute(f"SELECT * FROM sys_audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?", [*params, page_size, (page - 1) * page_size]).fetchall()
         items = []
@@ -73,10 +85,16 @@ def admin_audit_log(keyword: str = "", page: int = Query(1, ge=1), page_size: in
 
 
 @router.get("/api/admin/audit-log/export")
-def admin_audit_export(keyword: str = "", admin=Depends(require_admin)) -> Response:
-    data = admin_audit_log(keyword=keyword, page=1, page_size=5000, admin=admin)
+def admin_audit_export(keyword: str = "", jti: str = "", admin=Depends(require_admin)) -> Response:
+    data = admin_audit_log(keyword=keyword, jti=jti, page=1, page_size=5000, admin=admin)
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=["created_at", "username", "role", "action", "action_label", "target", "detail", "ip"])
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "created_at", "username", "role", "action", "action_label", "target",
+            "business_time_field", "start_time", "end_time", "detail", "ip",
+        ],
+    )
     writer.writeheader()
     for item in data["items"]:
         writer.writerow({key: item.get(key, "") for key in writer.fieldnames})

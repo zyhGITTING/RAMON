@@ -7,6 +7,7 @@ from typing import Any
 import requests
 from fastapi import HTTPException
 
+from backend.app.core.outbound_http import OutboundRequestBlocked, safe_outbound_request
 from backend.app.db.repositories.config import get_config, set_config
 from backend.app.services.datasource_service import (
     normalize_field_label_map,
@@ -321,11 +322,28 @@ searchable_fields, field_labels, parameter_docs, request_config, response_config
     }
     verify_tls = bool(service.get("verify_tls", True))
     try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=60, verify=verify_tls)
+        response = safe_outbound_request(
+            "POST",
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=60,
+            verify=verify_tls,
+        )
         if response.status_code >= 400:
             fallback_payload = dict(payload)
             fallback_payload.pop("response_format", None)
-            response = requests.post(endpoint, headers=headers, json=fallback_payload, timeout=60, verify=verify_tls)
+            response.close()
+            response = safe_outbound_request(
+                "POST",
+                endpoint,
+                headers=headers,
+                json=fallback_payload,
+                timeout=60,
+                verify=verify_tls,
+            )
+    except OutboundRequestBlocked as exc:
+        raise HTTPException(status_code=400, detail=f"LLM outbound request blocked: {exc}") from exc
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
     if response.status_code >= 400:

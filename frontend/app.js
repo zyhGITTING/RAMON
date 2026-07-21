@@ -64,6 +64,7 @@ renderPlatform(); updateGlobalStatus();
     set_user_field_permissions: '设置用户字段权限',
     set_department_field_permissions: '设置部门字段权限',
     set_field_restriction: '设置字段限制',
+    update_field_metadata: '维护字段标准',
     create_platform: '创建平台',
     update_platform: '更新平台',
     delete_platform: '删除平台',
@@ -89,6 +90,8 @@ renderPlatform(); updateGlobalStatus();
     url_sso_auto_register: 'URL SSO 自动注册',
     url_sso_login: 'URL SSO 登录',
   };
+  AUDIT_ACTION_LABELS.mcp_token_rejected = 'MCP 令牌被拒绝';
+  AUDIT_ACTION_LABELS.mcp_anomaly_detected = 'MCP 异常调用';
   const ROLE_LABELS = { admin: '管理员', user: '用户', system: '系统' };
 
   const state = {
@@ -99,7 +102,12 @@ renderPlatform(); updateGlobalStatus();
     dataCache: {},
     catalogItems: [],
     catalogKeyword: '',
-    admin: {stats:null,users:[],syncLogs:[],auditLogs:[],auditKeyword:'',mcpKeyword:'',mcpStatus:'active',mcpReqKeyword:'',mcpReqStatus:'pending'},
+    admin: {
+      stats:null, users:[], userPage:1, userPageSize:30, userTotal:0, userKeyword:'',
+      dsPage:1, dsPageSize:20, dsTotal:0, dsKeyword:'',
+      syncLogs:[], auditLogs:[], auditKeyword:'', auditJti:'', mcpKeyword:'', mcpStatus:'active',
+      mcpReqKeyword:'', mcpReqStatus:'pending'
+    },
   };
   const features = {
     selfRegisterEnabled: false,
@@ -285,7 +293,8 @@ renderPlatform(); updateGlobalStatus();
   function updateLoginUI() {
     const loggedIn = !!(state.user);
     $('dmNavLoginBtn').classList.toggle('dm-hidden', loggedIn);
-    $('dmNavChangePwdBtn').classList.toggle('dm-hidden', !loggedIn);
+    const changePasswordButton = $('dmNavChangePwdBtn');
+    if (changePasswordButton) changePasswordButton.classList.toggle('dm-hidden', !loggedIn);
     $('dmNavLogoutBtn').classList.toggle('dm-hidden', !loggedIn);
     $('dmNavChip').textContent = loggedIn ? (state.user.full_name || state.user.username) : '未登录';
     const isAdmin = loggedIn && state.user.role === 'admin';
@@ -502,13 +511,25 @@ renderPlatform(); updateGlobalStatus();
     }
   }
 
-  $('dmNavChangePwdBtn').addEventListener('click', openChangePasswordDialog);
-  $('dmChangePwdClose').addEventListener('click', closeChangePasswordDialog);
-  $('dmChangePwdCancel').addEventListener('click', closeChangePasswordDialog);
-  $('dmChangePwdSubmit').addEventListener('click', submitChangePassword);
-  $('dmChangePwdMask').addEventListener('click', e => { if (e.target === $('dmChangePwdMask')) closeChangePasswordDialog(); });
+  const changePasswordBindings = [
+    ['dmNavChangePwdBtn', 'click', openChangePasswordDialog],
+    ['dmChangePwdClose', 'click', closeChangePasswordDialog],
+    ['dmChangePwdCancel', 'click', closeChangePasswordDialog],
+    ['dmChangePwdSubmit', 'click', submitChangePassword],
+  ];
+  changePasswordBindings.forEach(([id, eventName, handler]) => {
+    const el = $(id);
+    if (el) el.addEventListener(eventName, handler);
+  });
+  const changePasswordMask = $('dmChangePwdMask');
+  if (changePasswordMask) {
+    changePasswordMask.addEventListener('click', e => {
+      if (e.target === changePasswordMask) closeChangePasswordDialog();
+    });
+  }
   ['dmChangePwdOld', 'dmChangePwdNew', 'dmChangePwdNew2'].forEach(id => {
-    $(id).addEventListener('keydown', e => { if (e.key === 'Enter') submitChangePassword(); });
+    const el = $(id);
+    if (el) el.addEventListener('keydown', e => { if (e.key === 'Enter') submitChangePassword(); });
   });
 
   window.dmAuthDoLogin = async function() {
@@ -972,15 +993,17 @@ renderPlatform(); updateGlobalStatus();
           business_domain: '',
           definition: ''
         }));
-    const visibleFieldMeta = fieldMeta.filter(item => {
-      const fieldName = String(item.field_name || '').trim();
-      const fieldLabel = String(item.field_label || '').trim();
-      return !!fieldName && !!fieldLabel && fieldLabel !== fieldName;
-    });
+    const visibleFieldMeta = fieldMeta.filter(item => String(item.field_name || '').trim());
+    const standardizedCount = visibleFieldMeta.filter(item => String(item.standard_field_code || '').trim()).length;
     const fieldList = visibleFieldMeta.map(item => `
-      <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:linear-gradient(90deg,#dbeafe 0%,#eff6ff 100%);border-left:4px solid #2563eb;">
-        <span style="font-size:12px;font-weight:700;color:#1d4ed8;line-height:1.4;">${escapeHtml(item.field_label)}</span>
+      <div style="display:flex;flex-direction:column;gap:4px;padding:9px 10px;border-radius:8px;background:${item.standard_field_code ? '#eff6ff' : '#f8fafc'};border-left:4px solid ${item.standard_field_code ? '#2563eb' : '#cbd5e1'};">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:6px;">
+          <span style="font-size:12px;font-weight:700;color:${item.standard_field_code ? '#1d4ed8' : '#475569'};line-height:1.4;">${escapeHtml(item.standard_field_code ? (item.standard_field_name || item.field_label || item.field_name) : (item.field_label || item.field_name))}</span>
+          <span style="font-size:10px;white-space:nowrap;color:${item.standard_field_code ? '#166534' : '#92400e'};background:${item.standard_field_code ? '#dcfce7' : '#fef3c7'};padding:1px 5px;border-radius:4px;">${item.standard_field_code ? '已标准化' : '待标准化'}</span>
+        </div>
+        ${item.field_label && item.field_label !== item.standard_field_name && item.field_label !== item.field_name ? `<span style="font-size:11px;color:#475569;">${escapeHtml(item.field_label)}</span>` : ''}
         <span style="font-size:11px;color:#64748b;font-family:monospace;line-height:1.4;word-break:break-all;">${escapeHtml(item.field_name)}</span>
+        ${item.standard_field_code ? `<span style="font-size:10px;color:#94a3b8;font-family:monospace;word-break:break-all;">${escapeHtml(item.standard_field_code)}</span>` : ''}
       </div>`).join('');
     const platName = (() => {
       if (!ds.platform_id) return '—';
@@ -990,18 +1013,19 @@ renderPlatform(); updateGlobalStatus();
 
     // 左栏：字段说明
     $('dmDdFieldPanel').innerHTML = fieldList
-      ? `<div style="font-size:11px;color:#94a3b8;font-weight:600;letter-spacing:.5px;text-transform:uppercase;margin-bottom:12px;">OneData 字段标准</div>
+      ? `<div style="margin-bottom:12px;"><div style="font-size:11px;color:#64748b;font-weight:700;letter-spacing:.5px;text-transform:uppercase;">OneData 字段目录</div><div style="font-size:10px;color:#94a3b8;margin-top:3px;">已标准化 ${standardizedCount}/${visibleFieldMeta.length}</div></div>
          <div style="display:flex;flex-direction:column;gap:8px;">${fieldList}</div>`
-       : `<div style="color:#94a3b8;font-size:13px;">暂无可展示的中文字段标注</div>`;
+       : `<div style="color:#94a3b8;font-size:13px;">暂无字段，请先完成一次数据同步</div>`;
 
     const parameterDocsHtml = renderParameterDocs(ds.request_config || {});
 
     // 右栏：数据预览
     $('dmDsDetailBody').innerHTML = `
       ${parameterDocsHtml}
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
         <span style="font-size:14px;font-weight:600;color:#1e293b;">数据预览</span>
-        <button class="dm-btn ${hasPerm?'primary':'secondary'}" style="font-size:12px;padding:5px 14px;" onclick="loadDetailData('${escapeHtml(ds.source_key)}')">
+        ${ds.business_time_field ? `<input class="dm-input" id="dmDdStartTime" type="datetime-local" aria-label="开始时间" title="开始时间" style="width:190px;padding:5px 8px;"><span style="font-size:12px;color:#64748b;">至</span><input class="dm-input" id="dmDdEndTime" type="datetime-local" aria-label="结束时间" title="结束时间" style="width:190px;padding:5px 8px;">` : ''}
+        <button class="dm-btn ${hasPerm?'primary':'secondary'}" id="dmDdLoadData" style="font-size:12px;padding:5px 14px;">
           ${hasPerm ? '加载数据（前 20 条）' : '查看示例数据（5 条）'}
         </button>
       </div>
@@ -1016,6 +1040,13 @@ renderPlatform(); updateGlobalStatus();
       </div>` : ''}`;
 
     $('dmDsDetailMask').classList.remove('dm-hidden');
+    $('dmDdLoadData').addEventListener('click', () => loadDetailData(
+      ds.source_key,
+      '',
+      '',
+      $('dmDdStartTime') ? $('dmDdStartTime').value : '',
+      $('dmDdEndTime') ? $('dmDdEndTime').value : ''
+    ));
     if (isAdmin) loadDetailVersions(ds.source_key);
   };
 
@@ -1058,7 +1089,8 @@ renderPlatform(); updateGlobalStatus();
     _mcpApplySource = ds;
     $('dmMcpApplySourceName').textContent = `数据源：${ds.source_name}`;
     $('dmMcpApplyReason').value = '';
-    $('dmMcpApplyValidity').value = '3m';
+    const validitySelect = $('dmMcpApplyValidity');
+    if (validitySelect) validitySelect.value = '3m';
     $('dmMcpApplyMask').classList.remove('dm-hidden');
   }
   $('dmMcpApplyClose').addEventListener('click', () => $('dmMcpApplyMask').classList.add('dm-hidden'));
@@ -1069,7 +1101,7 @@ renderPlatform(); updateGlobalStatus();
     const submitBtn = $('dmMcpApplySubmit');
     if (submitBtn.disabled) return;
     const reason = ($('dmMcpApplyReason').value || '').trim();
-    const validityPeriod = $('dmMcpApplyValidity').value || '3m';
+    const validityPeriod = $('dmMcpApplyValidity')?.value || '3m';
     if (reason.length < 2) { showToast('请填写至少 2 个字的申请原因', true); return; }
     const oldLabel = submitBtn.textContent;
     submitBtn.disabled = true;
@@ -1091,7 +1123,7 @@ renderPlatform(); updateGlobalStatus();
     }
   });
 
-  window.loadDetailData = async function(sourceKey, asOf='', syncVersion='') {
+  window.loadDetailData = async function(sourceKey, asOf='', syncVersion='', startTime='', endTime='') {
     const el = $('dmDdDataZone');
     if (!el) return;
     el.innerHTML = '<span style="color:#64748b;font-size:13px;">加载中...</span>';
@@ -1099,6 +1131,8 @@ renderPlatform(); updateGlobalStatus();
       const qs = new URLSearchParams({page:'1',page_size:'20'});
       if (asOf) qs.set('as_of', asOf);
       if (syncVersion) qs.set('sync_version', syncVersion);
+      if (startTime) qs.set('start_time', startTime);
+      if (endTime) qs.set('end_time', endTime);
       const r = await apiFetch(`/api/data/${sourceKey}?` + qs.toString());
       const rows = r.rows || [];
       if (!rows.length) { el.innerHTML = '<p style="color:#94a3b8;font-size:13px;">暂无数据</p>'; return; }
@@ -1228,13 +1262,10 @@ renderPlatform(); updateGlobalStatus();
       }
       const data = await resp.json();
       const markdown = String(data.markdown || '');
-      const tokenHint = data.mcp_token
-        ? `<div style="margin-bottom:12px;border:1px solid #bbf7d0;border-radius:10px;background:#f0fdf4;padding:12px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-            <span style="font-size:13px;color:#166534;font-weight:600;">✓ 已自动生成 MCP 令牌</span>
-            <span style="font-size:12px;color:#64748b;">到期时间：${escapeHtml(data.expires_at || '—')}</span>
-            <span style="font-size:12px;color:#94a3b8;margin-left:auto;">令牌已写入下方文档中，可复制直接使用</span>
-          </div>`
-        : '';
+      const tokenHint = `<div style="margin-bottom:12px;border:1px solid #bfdbfe;border-radius:10px;background:#eff6ff;padding:12px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span style="font-size:13px;color:#1d4ed8;font-weight:600;">安全文档：未自动签发令牌</span>
+          <span style="font-size:12px;color:#64748b;">需要调用时，请通过“MCP 导出”显式签发。</span>
+        </div>`;
       $('dmDocTitle').textContent = (data.source_name || sourceKey) + ' · 接口文档';
       $('dmDocBody').innerHTML = `
         ${tokenHint}
@@ -1284,10 +1315,38 @@ renderPlatform(); updateGlobalStatus();
       $('dmDeTokenToggle').textContent = '显示';
       $('dmDeDesc').value = ds.description || '';
       $('dmDeSearchable').value = (ds.searchable_fields || []).join(', ');
+      const businessTimeSelect = $('dmDeBusinessTime');
+      const businessTimeFields = Array.isArray(ds.field_meta) ? ds.field_meta.filter(item => item && item.field_name) : [];
+      businessTimeSelect.innerHTML = '<option value="">— 不启用时间范围查询 —</option>' + businessTimeFields.map(item => {
+        const name = String(item.field_name || '');
+        const label = String(item.standard_field_name || item.field_label || name);
+        return `<option value="${escapeHtml(name)}"${name === (ds.business_time_field || '') ? ' selected' : ''}>${escapeHtml(label)} (${escapeHtml(name)})</option>`;
+      }).join('');
+      if (ds.business_time_field && !businessTimeFields.some(item => item.field_name === ds.business_time_field)) {
+        businessTimeSelect.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(ds.business_time_field)}" selected>${escapeHtml(ds.business_time_field)}</option>`);
+      }
       $('dmDeQualityRules').value = prettyJson(ds.quality_rules || {});
       $('dmDeVerifyTls').checked = !!ds.verify_tls;
       $('dmDeReqCfg').value = prettyJson(ds.request_config || {});
       $('dmDeRespCfg').value = prettyJson(ds.response_config || {});
+
+      const incremental = ds.incremental_config || {};
+      const incEnabled = $('dmDeIncrementalEnabled');
+      if (incEnabled) {
+        incEnabled.checked = !!incremental.enabled;
+        const panel = $('dmDeIncrementalPanel');
+        if (panel) panel.style.display = incEnabled.checked ? 'flex' : 'none';
+      }
+      const incStrategy = $('dmDeIncrementalStrategy');
+      if (incStrategy) incStrategy.value = String(incremental.strategy || 'date_range');
+      const incMerge = $('dmDeIncrementalMergeStrategy');
+      if (incMerge) incMerge.value = String(incremental.merge_strategy || 'time_window_replace');
+      const incFormat = $('dmDeIncrementalFormat');
+      if (incFormat) incFormat.value = String(incremental.format || ds.date_format || 'date_string');
+      const incLookback = $('dmDeIncrementalLookback');
+      if (incLookback) incLookback.value = Number(incremental.lookback_seconds || 86400);
+      const incInitial = $('dmDeIncrementalInitial');
+      if (incInitial) incInitial.value = String(incremental.initial_value || '');
 
     // 填充平台下拉
     const sel = $('dmDePlatform');
@@ -1301,17 +1360,41 @@ renderPlatform(); updateGlobalStatus();
     if (!_currentDsEdit) return false;
     const ds = _currentDsEdit;
     const platformId = ds.platform_id ? String(ds.platform_id) : '';
+    const currentIncremental = ds.incremental_config || {};
+    const newIncremental = buildIncrementalConfigFromUI();
     return $('dmDeSourceName').value.trim() !== (ds.source_name || '') ||
       $('dmDeMethod').value !== (ds.http_method || 'POST') ||
       $('dmDeUrl').value.trim() !== (ds.api_url || '') ||
       $('dmDePlatform').value !== platformId ||
       $('dmDeDesc').value.trim() !== (ds.description || '') ||
       $('dmDeSearchable').value !== (ds.searchable_fields || []).join(', ') ||
+      $('dmDeBusinessTime').value !== (ds.business_time_field || '') ||
       $('dmDeQualityRules').value !== prettyJson(ds.quality_rules || {}) ||
       $('dmDeVerifyTls').checked !== !!ds.verify_tls ||
       $('dmDeReqCfg').value !== prettyJson(ds.request_config || {}) ||
       $('dmDeRespCfg').value !== prettyJson(ds.response_config || {}) ||
+      JSON.stringify(newIncremental) !== JSON.stringify(currentIncremental) ||
       $('dmDeToken').value.trim() !== '';
+  }
+
+  function buildIncrementalConfigFromUI() {
+    const enabledEl = $('dmDeIncrementalEnabled');
+    const enabled = enabledEl ? enabledEl.checked : false;
+    if (!enabled) {
+      return { enabled: false, strategy: 'full', merge_strategy: 'append', field: '', format: 'string', lookback_seconds: 86400, initial_value: '' };
+    }
+    const formatEl = $('dmDeIncrementalFormat');
+    const lookbackEl = $('dmDeIncrementalLookback');
+    const initialEl = $('dmDeIncrementalInitial');
+    return {
+      enabled: true,
+      strategy: 'date_range',
+      merge_strategy: 'time_window_replace',
+      field: $('dmDeBusinessTime') ? $('dmDeBusinessTime').value : '',
+      format: formatEl ? formatEl.value : 'date_string',
+      lookback_seconds: lookbackEl ? (parseInt(lookbackEl.value, 10) || 86400) : 86400,
+      initial_value: initialEl ? initialEl.value.trim() : '',
+    };
   }
 
   function closeDatasourceEditModal(force) {
@@ -1343,6 +1426,13 @@ renderPlatform(); updateGlobalStatus();
     input.type = show ? 'text' : 'password';
     $('dmDeTokenToggle').textContent = show ? '隐藏' : '显示';
   });
+  const dmDeIncrementalEnabled = $('dmDeIncrementalEnabled');
+  if (dmDeIncrementalEnabled) {
+    dmDeIncrementalEnabled.addEventListener('change', () => {
+      const panel = $('dmDeIncrementalPanel');
+      if (panel) panel.style.display = dmDeIncrementalEnabled.checked ? 'flex' : 'none';
+    });
+  }
   $('dmDeDelete').addEventListener('click', () => {
     if (_currentDsEdit) openDatasourceDeleteModal(_currentDsEdit);
   });
@@ -1385,11 +1475,13 @@ renderPlatform(); updateGlobalStatus();
       api_url: $('dmDeUrl').value.trim(),
       platform_id: platformVal ? parseInt(platformVal) : 0,
       description: $('dmDeDesc').value.trim(),
+      business_time_field: $('dmDeBusinessTime').value,
       searchable_fields: parseCommaList($('dmDeSearchable').value),
       quality_rules: parseJsonInput($('dmDeQualityRules').value, '质量规则'),
       verify_tls: $('dmDeVerifyTls').checked,
       request_config: parseJsonInput($('dmDeReqCfg').value, '请求配置'),
       response_config: parseJsonInput($('dmDeRespCfg').value, '响应配置'),
+      incremental_config: buildIncrementalConfigFromUI(),
     };
     if (tokenVal === 'clear') body.token = '';
     else if (tokenVal) body.token = tokenVal;
@@ -1442,6 +1534,7 @@ renderPlatform(); updateGlobalStatus();
           <p style="color:#166534;font-size:13px;margin:0 0 4px;">令牌生成成功</p>
           <p style="color:#64748b;font-size:11px;margin:0;">部门: ${escapeHtml(data.department||'未设置')} · 数据源: ${escapeHtml(data.source_keys.join(', '))} · 到期: ${escapeHtml(data.expires_at || '90 天后')}</p>
           <p style="color:#94a3b8;font-size:11px;margin:6px 0 0;">令牌编号: ${escapeHtml(String(data.token_id || ''))} · 可在“我的 MCP 列表”中自行停用或删除；IP 仅用于审计，不再限制调用</p>
+          <p style="color:#b45309;font-size:11px;margin:6px 0 0;">凭据仅在本次签发结果中显示；关闭后只能查看不含令牌的配置模板。</p>
         </div>
         <div style="border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;padding:14px;overflow:auto;max-height:400px;">
           <pre style="color:#334155;font-size:11px;margin:0;white-space:pre-wrap;word-break:break-all;">${escapeHtml(data.config_json)}</pre>
@@ -1476,6 +1569,7 @@ renderPlatform(); updateGlobalStatus();
           <p style="color:#166534;font-size:13px;margin:0 0 4px;">MCP(HTTP) 令牌生成成功</p>
           <p style="color:#64748b;font-size:11px;margin:0;">部门: ${escapeHtml(data.department||'未设置')} · 数据源: ${escapeHtml(data.source_keys.join(', '))} · 到期: ${escapeHtml(data.expires_at || '90 天后')}</p>
           <p style="color:#94a3b8;font-size:11px;margin:6px 0 0;">令牌编号: ${escapeHtml(String(data.token_id || ''))} · 可在“我的 MCP 列表”中自行停用或删除；IP 仅用于审计，不再限制调用</p>
+          <p style="color:#b45309;font-size:11px;margin:6px 0 0;">凭据仅在本次签发结果中显示；关闭后只能查看不含令牌的配置模板。</p>
         </div>
         <div style="border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;padding:14px;overflow:auto;max-height:400px;">
           <pre style="color:#334155;font-size:11px;margin:0;white-space:pre-wrap;word-break:break-all;">${escapeHtml(data.config_json)}</pre>
@@ -1493,13 +1587,13 @@ renderPlatform(); updateGlobalStatus();
   window.exportMcpHttp = exportMcpHttp;
   $('dmMcpClose').addEventListener('click', () => $('dmMcpMask').classList.add('dm-hidden'));
 
-  // ======== 查看 MCP 原文 ========
+  // ======== 查看不含凭据的 MCP 配置模板 ========
   async function viewMcpOriginal(tokenId, isAdmin) {
     if (!state.user) { showToast('请先登录', true); return; }
     const endpoint = isAdmin
       ? '/api/admin/mcp-token/' + tokenId + '/config'
       : '/api/mcp/token/' + tokenId + '/config';
-    $('dmMcpBody').innerHTML = '<div style="border:1px solid #dbeafe;border-radius:12px;background:#f8fbff;padding:16px;margin:0;"><p style="color:#64748b;font-size:13px;">正在加载 MCP 原文配置...</p></div>';
+    $('dmMcpBody').innerHTML = '<div style="border:1px solid #dbeafe;border-radius:12px;background:#f8fbff;padding:16px;margin:0;"><p style="color:#64748b;font-size:13px;">正在加载 MCP 配置模板...</p></div>';
     $('dmMcpMask').classList.remove('dm-hidden');
     try {
       const data = await apiFetch(endpoint, {method:'POST'});
@@ -1507,8 +1601,9 @@ renderPlatform(); updateGlobalStatus();
       const hasHttp = !!data.config_json_http;
       $('dmMcpBody').innerHTML = `
         <div style="border:1px solid #bbf7d0;border-radius:12px;background:#f0fdf4;padding:12px 16px;margin-bottom:12px;">
-          <p style="color:#166534;font-size:13px;margin:0;">MCP 原文配置</p>
+          <p style="color:#166534;font-size:13px;margin:0;">MCP 配置模板（不含令牌）</p>
           <p style="color:#64748b;font-size:11px;margin:4px 0 0;">数据源: ${escapeHtml((data.source_keys||[]).join(', '))} · 状态: ${escapeHtml(data.status||'')} · 到期: ${escapeHtml(data.expires_at||'')}</p>
+          <p style="color:#b45309;font-size:11px;margin:4px 0 0;">配置中已包含令牌，可直接复制使用；请妥善保管，避免泄露。</p>
         </div>
         ${hasSse ? `
         <div style="margin-bottom:12px;">
@@ -1530,7 +1625,7 @@ renderPlatform(); updateGlobalStatus();
             <pre id="mcpOriginalHttp" style="color:#334155;font-size:11px;margin:0;white-space:pre-wrap;word-break:break-all;">${escapeHtml(data.config_json_http)}</pre>
           </div>
         </div>` : ''}
-        ${!hasSse && !hasHttp ? '<p style="color:#94a3b8;font-size:12px;">该令牌没有保存原文配置（可能是旧令牌或数据缺失）。</p>' : ''}`;
+        ${!hasSse && !hasHttp ? '<p style="color:#94a3b8;font-size:12px;">该记录无法生成配置模板。</p>' : ''}`;
     } catch(err) {
       $('dmMcpBody').innerHTML = `
         <div style="border:1px solid #fecaca;border-radius:12px;background:#fef2f2;padding:16px;margin-bottom:12px;">
@@ -1545,26 +1640,44 @@ renderPlatform(); updateGlobalStatus();
   document.getElementById('adminSideNav').addEventListener('click', async function(e) {
     const item = e.target.closest('.admin-nav-item');
     if (!item) return;
+    const view = item.dataset.admin;
     document.querySelectorAll('#platNav .plat-item').forEach(el=>el.classList.remove('active'));
     document.querySelectorAll('#adminSideNav .admin-nav-item').forEach(el=>el.classList.remove('active'));
     document.querySelectorAll('#userSideNav .admin-nav-item').forEach(el=>el.classList.remove('active'));
     item.classList.add('active');
-    currentAdminView = item.dataset.admin;
+    currentAdminView = view;
     expandedCard = null;
-    await loadAdminData();
-    renderAdminView(currentAdminView);
+    await loadAdminData(view);
+    if (currentAdminView !== view) return;
+    renderAdminView(view);
   });
 
-  async function loadAdminData() {
+  async function loadAdminData(view = currentAdminView) {
     if (!state.user || state.user.role !== 'admin') return;
     try {
-      const [stats, users, syncLog, auditLog] = await Promise.all([
-        apiFetch('/api/admin/stats', {method:'POST'}),
-        apiFetch('/api/admin/user/list', {method:'POST'}),
-        apiFetch('/api/admin/sync-log?page=1&page_size=20', {method:'POST'}),
-        apiFetch('/api/admin/audit-log?page=1&page_size=20&keyword='+encodeURIComponent(state.admin.auditKeyword||''), {method:'POST'}),
-      ]);
-      state.admin.stats = stats; state.admin.users = users.items||[]; state.admin.syncLogs = syncLog.items||[]; state.admin.auditLogs = auditLog.items||[];
+      if (view === 'users') {
+        const qs = new URLSearchParams({
+          page: String(state.admin.userPage || 1),
+          page_size: String(state.admin.userPageSize || 30),
+          keyword: state.admin.userKeyword || '',
+        });
+        const users = await apiFetch('/api/admin/user/list?' + qs.toString(), {method:'POST'});
+        state.admin.users = users.items || [];
+        state.admin.userTotal = Number(users.total || 0);
+        state.admin.userPage = Number(users.page || state.admin.userPage || 1);
+      } else if (view === 'sync') {
+        const syncLog = await apiFetch('/api/admin/sync-log?page=1&page_size=20', {method:'POST'});
+        state.admin.syncLogs = syncLog.items || [];
+      } else if (view === 'audit') {
+        const qs = new URLSearchParams({
+          page: '1',
+          page_size: '20',
+          keyword: state.admin.auditKeyword || '',
+          jti: state.admin.auditJti || '',
+        });
+        const auditLog = await apiFetch('/api/admin/audit-log?' + qs.toString(), {method:'POST'});
+        state.admin.auditLogs = auditLog.items || [];
+      }
     } catch(e) { showToast('加载管理数据失败: '+e.message, true); }
   }
 
@@ -1586,6 +1699,10 @@ renderPlatform(); updateGlobalStatus();
 
   function renderAdminUsers() {
     const users = state.admin.users;
+    const total = Number(state.admin.userTotal || 0);
+    const page = Number(state.admin.userPage || 1);
+    const pageSize = Number(state.admin.userPageSize || 30);
+    const pageCount = Math.max(1, Math.ceil(total / pageSize));
     const html = `
     <div class="mb-5"><h1 class="text-xl font-bold text-slate-800">用户管理</h1><p class="text-sm text-slate-500 mt-1">管理平台用户、分配数据源权限</p></div>
     <div class="admin-panel">
@@ -1601,7 +1718,11 @@ renderPlatform(); updateGlobalStatus();
       <button class="dm-btn primary" id="dmCreateUserBtn">创建用户</button>
     </div>
     <div class="admin-panel">
-      <h3>用户列表（${users.length} 人）</h3>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+        <h3 style="margin:0;margin-right:auto;">用户列表（共 ${total} 人）</h3>
+        <input class="dm-search" id="dmUserKeyword" value="${escapeHtml(state.admin.userKeyword||'')}" placeholder="工号、用户名、姓名或部门" style="width:min(320px,100%);">
+        <button class="dm-btn" id="dmUserSearch">搜索</button>
+      </div>
       <div style="overflow:auto;"><table class="dm-table">
         <thead><tr><th>ID</th><th>工号</th><th>用户名</th><th>姓名</th><th>部门</th><th>角色</th><th>操作</th></tr></thead>
         <tbody>${users.map(u=>`<tr>
@@ -1614,8 +1735,29 @@ renderPlatform(); updateGlobalStatus();
           </td>
         </tr>`).join('')}</tbody>
       </table></div>
+      <div style="display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:12px;">
+        <button class="dm-btn" id="dmUserPrev" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+        <span style="font-size:12px;color:#64748b;">第 ${page} / ${pageCount} 页</span>
+        <button class="dm-btn" id="dmUserNext" ${page >= pageCount ? 'disabled' : ''}>下一页</button>
+      </div>
     </div>`;
     $('mainContent').innerHTML = html;
+    const searchUsers = async () => {
+      state.admin.userKeyword = $('dmUserKeyword').value.trim();
+      state.admin.userPage = 1;
+      await loadAdminData('users');
+      renderAdminUsers();
+    };
+    $('dmUserSearch').addEventListener('click', searchUsers);
+    $('dmUserKeyword').addEventListener('keydown', e => { if (e.key === 'Enter') searchUsers(); });
+    $('dmUserPrev').addEventListener('click', async () => {
+      state.admin.userPage = Math.max(1, page - 1);
+      await loadAdminData('users'); renderAdminUsers();
+    });
+    $('dmUserNext').addEventListener('click', async () => {
+      state.admin.userPage = Math.min(pageCount, page + 1);
+      await loadAdminData('users'); renderAdminUsers();
+    });
     // Bind events
     $('dmCreateUserBtn').addEventListener('click', async ()=>{
       try {
@@ -1706,7 +1848,7 @@ renderPlatform(); updateGlobalStatus();
   async function loadPermForm(uid) {
     try {
       const [allDs, permData] = await Promise.all([
-        apiFetch('/api/admin/datasource/list', {method:'POST'}),
+        apiFetch('/api/admin/datasource/list?page=1&page_size=500', {method:'POST'}),
         apiFetch('/api/admin/user/' + uid + '/permissions'),
       ]);
       const sources = (allDs.items||[]).filter(s=>s.enabled);
@@ -1794,16 +1936,24 @@ renderPlatform(); updateGlobalStatus();
   // ======== 数据源管理 ========
   async function renderAdminDatasources() {
     let sources = [], platforms = [], llmServices = [];
+    const dsQs = new URLSearchParams({
+      page: String(state.admin.dsPage || 1),
+      page_size: String(state.admin.dsPageSize || 20),
+      keyword: state.admin.dsKeyword || '',
+    });
     try {
       const [dsR, ptR, llmR] = await Promise.all([
-        apiFetch('/api/admin/datasource/list', {method:'POST'}),
+        apiFetch('/api/admin/datasource/list?' + dsQs.toString(), {method:'POST'}),
         apiFetch('/api/admin/platform/list', {method:'POST'}),
         apiFetch('/api/admin/llm-service/list', {method:'POST'}).catch(() => ({items:[]})),
       ]);
       sources = dsR.items||[];
+      state.admin.dsTotal = Number(dsR.total || 0);
+      state.admin.dsPage = Number(dsR.page || state.admin.dsPage || 1);
       platforms = ptR.items||[];
       llmServices = llmR.items||[];
     } catch(e) { showToast(e.message,true); }
+    if (currentAdminView !== 'datasources') return;
 
     const platformOpts = platforms.map(p=>`<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('');
     const preferredLlm = llmServices.find(s=>s.is_default && s.enabled) || llmServices.find(s=>s.enabled) || llmServices[0] || null;
@@ -1883,6 +2033,7 @@ renderPlatform(); updateGlobalStatus();
         </div>
         <input class="dm-input" id="dmDsDesc" placeholder="描述" style="grid-column:1/-1;">
         <input class="dm-input" id="dmDsSearchable" placeholder="可搜索字段，多个字段用逗号分隔" style="grid-column:1/-1;">
+        <input class="dm-input" id="dmDsBusinessTime" placeholder="业务时间字段，如 created_at；留空表示不启用" style="grid-column:1/-1;">
         <textarea class="dm-input" id="dmDsQualityRules" rows="5" style="grid-column:1/-1;font-family:monospace;" placeholder='质量规则 JSON'></textarea>
         <textarea class="dm-input" id="dmDsReqCfg" rows="7" style="grid-column:1/-1;font-family:monospace;" placeholder='请求配置 JSON'></textarea>
         <textarea class="dm-input" id="dmDsRespCfg" rows="6" style="grid-column:1/-1;font-family:monospace;" placeholder='响应配置 JSON'></textarea>
@@ -1941,7 +2092,11 @@ renderPlatform(); updateGlobalStatus();
     </div>
 
     <div class="admin-panel">
-      <h3>已接入数据源（${sources.length}） <span style="font-size:11px;color:#94a3b8;font-weight:400;">停用后会从导航和自动同步中移除，但会保留配置、历史数据与版本记录。</span></h3>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+        <h3 style="margin:0;margin-right:auto;">已接入数据源（共 ${state.admin.dsTotal}） <span style="font-size:11px;color:#94a3b8;font-weight:400;">停用后会保留配置、历史数据与版本记录。</span></h3>
+        <input class="dm-search" id="dmDsKeyword" value="${escapeHtml(state.admin.dsKeyword||'')}" placeholder="标识、名称或表名" style="width:min(300px,100%);">
+        <button class="dm-btn" id="dmDsSearch">搜索</button>
+      </div>
       <div style="overflow:auto;"><table class="dm-table">
         <thead><tr><th>ID</th><th>标识</th><th>名称</th><th>平台</th><th>方法</th><th>当前版本</th><th>版本数</th><th>Token</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>${sources.map(s=>`<tr>
@@ -1966,8 +2121,30 @@ renderPlatform(); updateGlobalStatus();
           </td>
         </tr>`).join('')}</tbody>
       </table></div>
+      <div style="display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:12px;">
+        <button class="dm-btn" id="dmDsPrev" ${state.admin.dsPage <= 1 ? 'disabled' : ''}>上一页</button>
+        <span style="font-size:12px;color:#64748b;">第 ${state.admin.dsPage} / ${Math.max(1, Math.ceil(state.admin.dsTotal / state.admin.dsPageSize))} 页</span>
+        <button class="dm-btn" id="dmDsNext" ${state.admin.dsPage >= Math.max(1, Math.ceil(state.admin.dsTotal / state.admin.dsPageSize)) ? 'disabled' : ''}>下一页</button>
+      </div>
     </div>`;
     $('mainContent').innerHTML = html;
+
+    const dsPageCount = Math.max(1, Math.ceil(state.admin.dsTotal / state.admin.dsPageSize));
+    const searchDatasources = async () => {
+      state.admin.dsKeyword = $('dmDsKeyword').value.trim();
+      state.admin.dsPage = 1;
+      await renderAdminDatasources();
+    };
+    $('dmDsSearch').addEventListener('click', searchDatasources);
+    $('dmDsKeyword').addEventListener('keydown', e => { if (e.key === 'Enter') searchDatasources(); });
+    $('dmDsPrev').addEventListener('click', async () => {
+      state.admin.dsPage = Math.max(1, state.admin.dsPage - 1);
+      await renderAdminDatasources();
+    });
+    $('dmDsNext').addEventListener('click', async () => {
+      state.admin.dsPage = Math.min(dsPageCount, state.admin.dsPage + 1);
+      await renderAdminDatasources();
+    });
 
     // Cache datasource objects for the edit modal.
     window._adminDsMap = {};
@@ -2223,6 +2400,7 @@ renderPlatform(); updateGlobalStatus();
           api_url:$('dmDsUrl').value.trim(), token:$('dmDsToken').value.trim(),
           platform_id: platformVal ? parseInt(platformVal) : null,
           description:$('dmDsDesc').value.trim(),
+          business_time_field:$('dmDsBusinessTime').value.trim(),
           searchable_fields: parseCommaList($('dmDsSearchable').value),
           quality_rules: parseJsonInput($('dmDsQualityRules').value, '质量规则'),
           verify_tls: $('dmDsVerifyTls').checked,
@@ -2245,6 +2423,7 @@ renderPlatform(); updateGlobalStatus();
           table_name:$('dmDsTable').value.trim()||'__test__', http_method:$('dmDsMethod').value,
           api_url:$('dmDsUrl').value.trim(), token:$('dmDsToken').value.trim(),
           description:$('dmDsDesc').value.trim(),
+          business_time_field:$('dmDsBusinessTime').value.trim(),
           searchable_fields: parseCommaList($('dmDsSearchable').value),
           quality_rules: parseJsonInput($('dmDsQualityRules').value, '质量规则'),
           verify_tls: $('dmDsVerifyTls').checked,
@@ -2282,6 +2461,11 @@ renderPlatform(); updateGlobalStatus();
     });
   }
   let _syncCountdownTimer = null;
+  let _syncProgressPollTimer = null;
+  let _syncProgressPollGeneration = 0;
+
+  $('dmSyncProgressClose').addEventListener('click', () => $('dmSyncProgressMask').classList.add('dm-hidden'));
+  $('dmSyncProgressMask').addEventListener('click', e=>{ if(e.target===$('dmSyncProgressMask')) $('dmSyncProgressMask').classList.add('dm-hidden'); });
 
   function fmtSecs(s) {
     if (s == null || s < 0) return '—';
@@ -2290,7 +2474,26 @@ renderPlatform(); updateGlobalStatus();
     return sec ? `${m} 分 ${sec} 秒` : `${m} 分钟`;
   }
 
+  function syncLogRowsHtml(logs) {
+    return logs.map(l=>{
+      const icon = formatStatusText(l.status);
+      let qualitySummary = '';
+      try { qualitySummary = JSON.parse(l.quality_report || '{}').summary || ''; } catch(e) {}
+      return `<tr>
+        <td style="white-space:nowrap;">${l.started_at||''}</td>
+        <td>${escapeHtml(l.source_name)}</td>
+        <td style="font-size:11px;white-space:normal;max-width:180px;color:#475569;">${escapeHtml(l.sync_version || '-')}</td>
+        <td>${l.row_count?.toLocaleString()||0}</td>
+        <td>${l.duration_ms}ms</td>
+        <td>${icon}</td>
+        <td style="font-size:11px;white-space:normal;max-width:220px;">${escapeHtml(formatStatusText(l.quality_status || 'na'))}<div style="color:#94a3b8;">${escapeHtml(qualitySummary)}</div></td>
+        <td style="max-width:320px;white-space:normal;font-size:11px;color:#64748b;">${escapeHtml(l.message||'')}</td>
+      </tr>`;
+    }).join('');
+  }
+
   async function renderAdminSync() {
+    if (currentAdminView !== 'sync') return;
     const logs = state.admin.syncLogs;
     // 先渲染骨架
     $('mainContent').innerHTML = `
@@ -2335,30 +2538,17 @@ renderPlatform(); updateGlobalStatus();
 
     <!-- 同步日志 -->
     <div class="admin-panel">
-      <h3>同步日志（最近 ${logs.length} 条）</h3>
+      <h3 id="dmSyncLogTitle">同步日志（最近 ${logs.length} 条）</h3>
       <div style="overflow:auto;"><table class="dm-table">
         <thead><tr><th>时间</th><th>数据源</th><th>版本</th><th>行数</th><th>耗时</th><th>同步状态</th><th>质量状态</th><th>信息</th></tr></thead>
-        <tbody>${logs.map(l=>{
-          const icon = formatStatusText(l.status);
-          let qualitySummary = '';
-          try { qualitySummary = JSON.parse(l.quality_report || '{}').summary || ''; } catch(e) {}
-          return `<tr>
-            <td style="white-space:nowrap;">${l.started_at||''}</td>
-            <td>${escapeHtml(l.source_name)}</td>
-            <td style="font-size:11px;white-space:normal;max-width:180px;color:#475569;">${escapeHtml(l.sync_version || '-')}</td>
-            <td>${l.row_count?.toLocaleString()||0}</td>
-            <td>${l.duration_ms}ms</td>
-            <td>${icon}</td>
-            <td style="font-size:11px;white-space:normal;max-width:220px;">${escapeHtml(formatStatusText(l.quality_status || 'na'))}<div style="color:#94a3b8;">${escapeHtml(qualitySummary)}</div></td>
-            <td style="max-width:320px;white-space:normal;font-size:11px;color:#64748b;">${escapeHtml(l.message||'')}</td>
-          </tr>`;
-        }).join('')}</tbody>
+        <tbody id="dmSyncLogBody">${syncLogRowsHtml(logs)}</tbody>
       </table></div>
     </div>`;
 
     // 加载状态并驱动 UI
     let syncStatus = null;
     try { syncStatus = await apiFetch('/api/admin/sync/status'); } catch(e) {}
+    if (currentAdminView !== 'sync') return;
 
     function applyStatus(st) {
       if (!st) return;
@@ -2391,7 +2581,7 @@ renderPlatform(); updateGlobalStatus();
           return `<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;flex-wrap:wrap;">
             <span style="font-size:13px;font-weight:500;color:#334155;min-width:100px;">${escapeHtml(d.source_name)}</span>
             <span style="font-size:11px;color:#94a3b8;flex:1;min-width:120px;">${d.last_sync_at ? '上次: '+d.last_sync_at : '从未同步'} ${lastIcon}</span>
-            <span style="font-size:11px;color:#64748b;white-space:nowrap;">下次: <span class="ds-next-in" data-secs="${nextInSecs??''}">${nextLabel}</span></span>
+            <span class="dm-sync-next-slot">下次: <span class="ds-next-in" data-secs="${nextInSecs??''}">${nextLabel}</span></span>
             <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#64748b;white-space:nowrap;">
               间隔
               <div class="ds-interval-hms" data-sk="${d.source_key}" data-cur="${curInterval}">${hmsInputsHtml('dsInterval_'+d.source_key, curInterval || globalSec, {small:true})}</div>
@@ -2399,8 +2589,8 @@ renderPlatform(); updateGlobalStatus();
               ${curInterval ? `<button class="dm-tbl-btn ds-interval-reset" data-sk="${d.source_key}" style="font-size:11px;padding:2px 8px;">恢复全局</button>` : ''}
             </label>
             ${inCooldown
-              ? `<span class="dmCdBadge" style="font-size:11px;padding:2px 8px;border-radius:10px;background:#fef9c3;color:#92400e;white-space:nowrap;">冷却 <span class="cd-sec">${d.remaining}</span>s</span>`
-              : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:#dcfce7;color:#16a34a;">就绪</span>`}
+              ? `<span class="dmCdBadge dm-sync-state-slot" style="background:#fef9c3;color:#92400e;">冷却 <span class="cd-sec">${d.remaining}</span>s</span>`
+              : `<span class="dm-sync-state-slot" style="background:#dcfce7;color:#16a34a;">就绪</span>`}
             <button class="dm-tbl-btn" data-sync-key="${d.source_key}" data-sync-name="${escapeHtml(d.source_name)}" style="font-size:11px;padding:3px 10px;white-space:nowrap;">同步</button>
           </div>`;
         }).join('') : '<div style="color:#94a3b8;font-size:13px;">暂无数据源</div>';
@@ -2534,7 +2724,6 @@ renderPlatform(); updateGlobalStatus();
     }
 
     // 通用同步执行函数（sourceKey=null 表示全量）
-    let _syncPollTimer = null;
     async function doSync(sourceKey, sourceName) {
       const isAll = !sourceKey;
       $('dmSyncProgressTitle').textContent = isAll ? '全量同步' : `同步：${sourceName||sourceKey}`;
@@ -2568,15 +2757,19 @@ renderPlatform(); updateGlobalStatus();
         }
       };
 
-      // 轮询进度
-      if (_syncPollTimer) clearInterval(_syncPollTimer);
-      _syncPollTimer = setInterval(async () => {
+      // 单例递归轮询：上一轮响应结束后才安排下一轮，避免多个完成回调重复刷新页面。
+      if (_syncProgressPollTimer) clearTimeout(_syncProgressPollTimer);
+      const pollGeneration = ++_syncProgressPollGeneration;
+      const pollProgress = async () => {
+        if (pollGeneration !== _syncProgressPollGeneration) return;
+        let keepPolling = true;
         try {
           const prog = await apiFetch('/api/admin/sync/progress');
           const items = prog.items || [];
 
           if (!prog.is_active) {
-            clearInterval(_syncPollTimer); _syncPollTimer = null;
+            keepPolling = false;
+            if (pollGeneration === _syncProgressPollGeneration) _syncProgressPollTimer = null;
             stopBtn.classList.add('dm-hidden');
             const result = prog.result || {};
             const summary = result.summary || {};
@@ -2598,8 +2791,21 @@ renderPlatform(); updateGlobalStatus();
                   true
                 )}
               </div>`;
-            await loadAdminData();
-            if (document.getElementById('dmDsStatusList')) await renderAdminSync();
+            await loadAdminData('sync');
+            if (currentAdminView === 'sync') {
+              const logTitle = $('dmSyncLogTitle');
+              const logBody = $('dmSyncLogBody');
+              if (logTitle) logTitle.textContent = `同步日志（最近 ${state.admin.syncLogs.length} 条）`;
+              if (logBody) logBody.innerHTML = syncLogRowsHtml(state.admin.syncLogs);
+              try {
+                const latestStatus = await apiFetch('/api/admin/sync/status');
+                if (currentAdminView === 'sync') {
+                  syncStatus = latestStatus;
+                  secLeft = latestStatus?.seconds_until_next ?? null;
+                  applyStatus(latestStatus);
+                }
+              } catch(e) {}
+            }
             await loadDynamicPlatforms();
             return;
           }
@@ -2608,13 +2814,15 @@ renderPlatform(); updateGlobalStatus();
           $('dmSyncProgressTitle').textContent = isAll ? `全量同步中…` : `同步中：${sourceName||sourceKey}`;
           $('dmSyncProgressBody').innerHTML = `<div style="display:flex;flex-direction:column;gap:10px;">${_renderProgressItems(items, false)}</div>`;
         } catch(e) { /* 网络短暂抖动，继续轮询 */ }
-      }, 800);
+        if (keepPolling && pollGeneration === _syncProgressPollGeneration) {
+          _syncProgressPollTimer = setTimeout(pollProgress, 800);
+        }
+      };
+      _syncProgressPollTimer = setTimeout(pollProgress, 0);
     }
 
-    // 手动触发全量同步
+  // 手动触发全量同步
   $('dmSyncTrigger').addEventListener('click', () => doSync(null));
-  $('dmSyncProgressClose').addEventListener('click', () => $('dmSyncProgressMask').classList.add('dm-hidden'));
-  $('dmSyncProgressMask').addEventListener('click', e=>{ if(e.target===$('dmSyncProgressMask')) $('dmSyncProgressMask').classList.add('dm-hidden'); });
   }
 
   async function renderAdminMcp() {
@@ -2687,7 +2895,8 @@ renderPlatform(); updateGlobalStatus();
               </td>
               <td>
                 <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                  <button class="dm-tbl-btn" data-mcp-view="${item.id}">查看原文</button>
+                  <button class="dm-tbl-btn" data-mcp-audit="${escapeHtml(item.jti || '')}">调用记录</button>
+                  <button class="dm-tbl-btn" data-mcp-view="${item.id}">配置模板</button>
                   ${item.status === 'active' || item.status === 'expired'
                     ? `<button class="dm-tbl-btn" data-mcp-expiry="${item.id}" data-mcp-validity="${escapeHtml(item.validity_period || '3m')}">改有效期</button>${item.status === 'active' ? `<button class="dm-tbl-btn danger" data-mcp-revoke="${item.id}" data-mcp-user="${escapeHtml(item.username || '')}">停用</button>` : ''}`
                     : '<span style="font-size:11px;color:#94a3b8;">-</span>'}
@@ -2715,6 +2924,17 @@ renderPlatform(); updateGlobalStatus();
       state.admin.mcpKeyword = $('dmMcpKeyword').value.trim();
       state.admin.mcpStatus = $('dmMcpStatus').value;
       renderAdminMcp();
+    });
+    document.querySelectorAll('[data-mcp-audit]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        state.admin.auditJti = btn.dataset.mcpAudit || '';
+        state.admin.auditKeyword = '';
+        currentAdminView = 'audit';
+        history.pushState(null, '', '?jti=' + encodeURIComponent(state.admin.auditJti));
+        document.querySelectorAll('#adminSideNav .admin-nav-item').forEach(el=>el.classList.toggle('active', el.dataset.admin === 'audit'));
+        await loadAdminData('audit');
+        renderAdminAudit();
+      });
     });
     document.querySelectorAll('[data-mcp-view]').forEach(btn=>{
       btn.addEventListener('click', ()=>{
@@ -2780,7 +3000,7 @@ renderPlatform(); updateGlobalStatus();
     const stats = tokenData.stats || {all:0,active:0,revoked:0,expired:0};
     const requests = (requestData.items || []).filter(item => item.status === 'pending');
     $('mainContent').innerHTML = `
-    <div class="mb-5"><h1 class="text-xl font-bold text-slate-800">我的 MCP 列表</h1><p class="text-sm text-slate-500 mt-1">查看已导出的 MCP 令牌、原文配置以及正在申请中的导出权限。</p></div>
+    <div class="mb-5"><h1 class="text-xl font-bold text-slate-800">我的 MCP 列表</h1><p class="text-sm text-slate-500 mt-1">查看已导出的 MCP 令牌记录、安全配置模板以及正在申请中的导出权限。</p></div>
     <div class="admin-panel">
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;" class="dm-metrics">
         ${renderMetricCard(stats.all||0, '总导出数')}
@@ -2842,7 +3062,7 @@ renderPlatform(); updateGlobalStatus();
               <td style="white-space:normal;min-width:150px;">
                 <div style="display:flex;gap:6px;flex-wrap:wrap;">
                   ${item.status === 'active' ? `<button class="dm-tbl-btn danger" data-my-mcp-revoke="${item.id}">停用</button>` : ''}
-                  <button class="dm-tbl-btn" data-my-mcp-view="${item.id}">查看原文</button>
+                  <button class="dm-tbl-btn" data-my-mcp-view="${item.id}">配置模板</button>
                   <button class="dm-tbl-btn" data-my-mcp-delete="${item.id}">删除</button>
                 </div>
               </td>
@@ -3137,6 +3357,8 @@ renderPlatform(); updateGlobalStatus();
       if (l.source_name) parts.push(`数据源: ${escapeHtml(l.source_name)}`);
       if (l.keyword) parts.push(`关键词: ${escapeHtml(l.keyword)}`);
       if (l.as_of) parts.push(`历史版本: ${escapeHtml(l.as_of)}`);
+      if (l.start_time || l.end_time) parts.push(`业务时间: ${escapeHtml(l.start_time || '不限')} 至 ${escapeHtml(l.end_time || '不限')}`);
+      if (l.business_time_field) parts.push(`时间字段: ${escapeHtml(l.business_time_field)}`);
       if (l.page != null && l.page_size != null) parts.push(`分页: ${l.page} / 每页${l.page_size}`);
       if (l.row_count != null) parts.push(`本页行数: ${l.row_count}`);
       if (l.total_count != null) parts.push(`总行数: ${l.total_count}`);
@@ -3152,6 +3374,8 @@ renderPlatform(); updateGlobalStatus();
       if (l.source_name) parts.push(`数据源: ${escapeHtml(l.source_name)}`);
       if (l.keyword) parts.push(`关键词: ${escapeHtml(l.keyword)}`);
       if (l.as_of) parts.push(`历史版本: ${escapeHtml(l.as_of)}`);
+      if (l.start_time || l.end_time) parts.push(`业务时间: ${escapeHtml(l.start_time || '不限')} 至 ${escapeHtml(l.end_time || '不限')}`);
+      if (l.business_time_field) parts.push(`时间字段: ${escapeHtml(l.business_time_field)}`);
       if (l.page != null && l.page_size != null) parts.push(`分页: ${l.page} / 每页${l.page_size}`);
       if (l.total_count != null) parts.push(`总行数: ${l.total_count}`);
       return parts.length ? parts.join('；') : escapeHtml(l.detail || '');
@@ -3165,6 +3389,7 @@ renderPlatform(); updateGlobalStatus();
     <div class="admin-panel">
       <div style="display:flex;gap:8px;align-items:center;">
         <input class="dm-search" id="dmAuditKeyword" placeholder="筛选审计日志" value="${escapeHtml(state.admin.auditKeyword||'')}" style="flex:1;max-width:320px;">
+        <input class="dm-search" id="dmAuditJti" placeholder="JTI" value="${escapeHtml(state.admin.auditJti||'')}" style="flex:1;max-width:320px;">
         <button class="dm-btn primary" id="dmAuditSearch">搜索</button>
         <button class="dm-btn" id="dmAuditExport">导出 CSV</button>
       </div>
@@ -3186,8 +3411,11 @@ renderPlatform(); updateGlobalStatus();
     });
     $('dmAuditExport').addEventListener('click', async ()=>{
       try {
-        const kw = encodeURIComponent(state.admin.auditKeyword||'');
-        const resp = await fetch(API_BASE+'/api/admin/audit-log/export?keyword='+kw,{
+        const qs = new URLSearchParams({
+          keyword: state.admin.auditKeyword || '',
+          jti: state.admin.auditJti || '',
+        });
+        const resp = await fetch(API_BASE+'/api/admin/audit-log/export?'+qs.toString(),{
           headers:{'Authorization':'Bearer '+state.token}
         });
         if (!resp.ok) throw new Error('导出失败');
@@ -3262,7 +3490,17 @@ renderPlatform(); updateGlobalStatus();
       // _checkForcePasswordChange();
     }
     if (state.user && state.user.role === 'admin') {
-      loadAdminData().catch(()=>{});
+      const auditJtiFromUrl = new URLSearchParams(window.location.search).get('jti') || '';
+      if (auditJtiFromUrl) {
+        state.admin.auditJti = auditJtiFromUrl;
+        state.admin.auditKeyword = '';
+        currentAdminView = 'audit';
+        document.querySelectorAll('#adminSideNav .admin-nav-item').forEach(el=>el.classList.toggle('active', el.dataset.admin === 'audit'));
+        await loadAdminData('audit').catch(()=>{});
+        renderAdminView('audit');
+      } else {
+        loadAdminData().catch(()=>{});
+      }
     }
   }
   // ======== 字段级权限 UI ========
@@ -3273,8 +3511,8 @@ renderPlatform(); updateGlobalStatus();
     ov.id = 'dmFieldRestrictOverlay';
     ov.className = 'dm-mask';
     ov.style.zIndex = '9999';
-    ov.innerHTML = `<div class="dm-modal dm-modal-light" style="width:min(1280px,calc(100vw - 48px));max-height:min(84vh,780px);aspect-ratio:16 / 9;display:flex;flex-direction:column;">
-      <div class="dm-modal-head"><div><h2>字段权限设置</h2><p>${escapeHtml(sourceName || sourceKey)}</p></div><button class="dm-close" type="button" id="dmFrClose">×</button></div>
+    ov.innerHTML = `<div class="dm-modal dm-modal-light" style="width:min(1320px,calc(100vw - 40px));height:min(86vh,820px);display:flex;flex-direction:column;">
+      <div class="dm-modal-head"><div><h2>OneData 字段标准与权限</h2><p>${escapeHtml(sourceName || sourceKey)}</p></div><button class="dm-close" type="button" id="dmFrClose">×</button></div>
       <div class="dm-modal-body" id="dmFrBody" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">加载中…</div></div>`;
     document.body.appendChild(ov);
     const close = () => ov.remove();
@@ -3283,12 +3521,16 @@ renderPlatform(); updateGlobalStatus();
     try {
       const r = await apiFetch('/api/admin/datasource/' + encodeURIComponent(sourceKey) + '/fields');
       const fields = r.items || [];
+      const standardCatalog = Array.isArray(r.standard_catalog) ? r.standard_catalog : [];
+      const catalogMap = Object.fromEntries(standardCatalog.map(item => [item.code, item]));
+      const catalogOptions = standardCatalog.map(item => `<option value="${escapeHtml(item.code)}">${escapeHtml(item.standard_field_name || item.code)}</option>`).join('');
       const cards = fields.map(f => {
         const acc = f.restricted_access || 'hide';
-        return `<div data-field="${escapeHtml(f.field_name)}" style="display:flex;flex-direction:column;gap:12px;border:1px solid #e2e8f0;border-radius:14px;padding:14px 16px;background:#fff;box-shadow:0 10px 24px rgba(15,23,42,0.05);">
+        const isStandardized = !!String(f.standard_field_code || '').trim();
+        return `<div data-field="${escapeHtml(f.field_name)}" style="display:flex;flex-direction:column;gap:12px;border:1px solid #e2e8f0;border-radius:8px;padding:14px 16px;background:#fff;">
           <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;">
             <div style="min-width:0;">
-              <div style="font-size:14px;font-weight:700;color:#0f172a;line-height:1.45;">${escapeHtml(f.field_label || f.field_name)}</div>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><div style="font-size:14px;font-weight:700;color:#0f172a;line-height:1.45;">${escapeHtml(isStandardized ? (f.standard_field_name || f.field_label || f.field_name) : (f.field_label || f.field_name))}</div><span style="font-size:10px;color:${isStandardized ? '#166534' : '#92400e'};background:${isStandardized ? '#dcfce7' : '#fef3c7'};padding:2px 6px;border-radius:4px;">${isStandardized ? '已标准化' : '待标准化'}</span></div>
               <div style="margin-top:4px;color:#94a3b8;font-size:11px;font-family:monospace;word-break:break-all;">${escapeHtml(f.field_name)}</div>
             </div>
             <label style="display:inline-flex;align-items:center;gap:6px;background:${f.is_restricted ? '#fef2f2' : '#f8fafc'};border:1px solid ${f.is_restricted ? '#fecaca' : '#e2e8f0'};border-radius:999px;padding:5px 10px;color:${f.is_restricted ? '#b91c1c' : '#64748b'};font-size:12px;white-space:nowrap;">
@@ -3296,53 +3538,90 @@ renderPlatform(); updateGlobalStatus();
               受限字段
             </label>
           </div>
-          <div style="display:grid;grid-template-columns:110px 1fr;gap:10px;align-items:center;">
-            <div style="font-size:12px;color:#64748b;">处置方式</div>
+          <div style="display:grid;grid-template-columns:110px minmax(0,1fr);gap:9px 10px;align-items:center;">
+            <label style="font-size:12px;color:#64748b;">中文名称</label>
+            <input class="fr-label" value="${escapeHtml(f.field_label || f.field_name)}" placeholder="字段中文名称" style="width:100%;background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:12px;">
+            <label style="font-size:12px;color:#64748b;">标准字段编码</label>
+            <input class="fr-standard-code" list="dmFrStandardCatalog" value="${escapeHtml(f.standard_field_code || '')}" placeholder="选择或输入标准编码" style="width:100%;background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:12px;font-family:monospace;">
+            <label style="font-size:12px;color:#64748b;">标准字段名称</label>
+            <input class="fr-standard-name" value="${escapeHtml(f.standard_field_name || f.field_label || f.field_name)}" placeholder="OneData 标准名称" style="width:100%;background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:12px;">
+            <label style="font-size:12px;color:#64748b;">业务域</label>
+            <input class="fr-business-domain" value="${escapeHtml(f.business_domain || '')}" placeholder="如 procurement / inventory" style="width:100%;background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:12px;">
+            <label style="font-size:12px;color:#64748b;align-self:start;padding-top:8px;">字段定义</label>
+            <textarea class="fr-definition" rows="2" placeholder="说明字段的业务含义和口径" style="width:100%;resize:vertical;background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:12px;">${escapeHtml(f.definition || '')}</textarea>
+            <label style="font-size:12px;color:#64748b;">受限后处置</label>
             <select class="fr-access" style="width:100%;background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:12px;">
               <option value="hide"${acc === 'hide' ? ' selected' : ''}>隐藏</option>
               <option value="mask"${acc === 'mask' ? ' selected' : ''}>脱敏</option>
             </select>
-            <div style="font-size:12px;color:#64748b;">脱敏规则</div>
+            <label style="font-size:12px;color:#64748b;">脱敏规则</label>
             <input class="fr-mask" value="${escapeHtml(f.mask_rule || '')}" placeholder="留空=全掩码；last4=保留后4位" style="width:100%;background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:12px;">
           </div>
-          <div style="font-size:11px;color:#64748b;line-height:1.6;">勾选后，该字段默认对非管理员隐藏或脱敏；是否可见再到“用户列表 → 分配权限”里按用户或部门授权。</div>
         </div>`;
       }).join('');
       ov.querySelector('#dmFrBody').innerHTML = `
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px;">
-          <p style="flex:1;color:#64748b;font-size:12px;margin:0;line-height:1.7;">勾选“受限字段”后，该列默认对普通用户隐藏或脱敏。未勾选表示只要有该数据源权限就能看到。管理员始终可见全部字段。</p>
+          <p style="flex:1;color:#64748b;font-size:12px;margin:0;line-height:1.7;">同步识别到的字段都会列在这里。维护中文名称和 OneData 标准后，接口详情、数据预览和 MCP 文档会统一使用；受限字段仍按用户或部门授权。</p>
           <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
-            <span style="display:inline-flex;align-items:center;gap:6px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:999px;padding:6px 10px;color:#64748b;font-size:11px;">隐藏：完全不可见</span>
-            <span style="display:inline-flex;align-items:center;gap:6px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:999px;padding:6px 10px;color:#64748b;font-size:11px;">脱敏：展示掩码值</span>
+            <span style="font-size:11px;color:#166534;background:#dcfce7;padding:5px 9px;border-radius:4px;">已标准化 ${fields.filter(f => f.standard_field_code).length}</span>
+            <span style="font-size:11px;color:#92400e;background:#fef3c7;padding:5px 9px;border-radius:4px;">待标准化 ${fields.filter(f => !f.standard_field_code).length}</span>
           </div>
         </div>
+        <datalist id="dmFrStandardCatalog">${catalogOptions}</datalist>
         <div style="flex:1;overflow:auto;border:1px solid #e2e8f0;border-radius:14px;background:#f8fafc;padding:16px;">
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px;align-items:start;">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:14px;align-items:start;">
             ${cards || '<div style="padding:20px;color:#94a3b8;font-size:13px;border:1px dashed #cbd5e1;border-radius:12px;background:#fff;">暂无字段（请先同步数据）</div>'}
           </div>
         </div>
         <div style="margin-top:14px;display:flex;justify-content:flex-end;gap:10px;padding-top:14px;border-top:1px solid #e2e8f0;">
           <button class="dm-btn" id="dmFrCancel">取消</button>
-          <button class="dm-btn primary" id="dmFrSave">保存</button>
+          <button class="dm-btn primary" id="dmFrSave" ${fields.length ? '' : 'disabled'}>保存</button>
         </div>`;
+      ov.querySelectorAll('.fr-standard-code').forEach(input => {
+        input.addEventListener('change', () => {
+          const metadata = catalogMap[input.value.trim()];
+          if (!metadata) return;
+          const card = input.closest('[data-field]');
+          card.querySelector('.fr-standard-name').value = metadata.standard_field_name || '';
+          card.querySelector('.fr-business-domain').value = metadata.business_domain || '';
+          card.querySelector('.fr-definition').value = metadata.definition || '';
+        });
+      });
       ov.querySelector('#dmFrCancel').addEventListener('click', close);
       ov.querySelector('#dmFrSave').addEventListener('click', async () => {
-        const trs = [...ov.querySelectorAll('[data-field]')];
+        const fieldCards = [...ov.querySelectorAll('[data-field]')];
+        const saveButton = ov.querySelector('#dmFrSave');
+        const oldLabel = saveButton.textContent;
+        saveButton.disabled = true;
+        saveButton.textContent = '保存中...';
         try {
-          for (const tr of trs) {
-            await apiFetch('/api/admin/datasource/' + encodeURIComponent(sourceKey) + '/field-restriction', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                source_key: sourceKey,
-                field_name: tr.getAttribute('data-field'),
-                is_restricted: tr.querySelector('.fr-restrict').checked,
-                restricted_access: tr.querySelector('.fr-access').value,
-                mask_rule: tr.querySelector('.fr-mask').value.trim(),
-              }),
-            });
-          }
-          showToast('字段权限已保存'); close();
-        } catch (e) { showToast(e.message, true); }
+          const items = fieldCards.map(card => ({
+            field_name: card.getAttribute('data-field'),
+            field_label: card.querySelector('.fr-label').value.trim(),
+            standard_field_code: card.querySelector('.fr-standard-code').value.trim(),
+            standard_field_name: card.querySelector('.fr-standard-name').value.trim(),
+            business_domain: card.querySelector('.fr-business-domain').value.trim(),
+            definition: card.querySelector('.fr-definition').value.trim(),
+            is_restricted: card.querySelector('.fr-restrict').checked,
+            restricted_access: card.querySelector('.fr-access').value,
+            mask_rule: card.querySelector('.fr-mask').value.trim(),
+          }));
+          await apiFetch('/api/admin/datasource/' + encodeURIComponent(sourceKey) + '/fields', {
+            method: 'POST',
+            body: JSON.stringify({items}),
+          });
+          const detailWasOpen = _currentDsDetail && _currentDsDetail.source_key === sourceKey && !$('dmDsDetailMask').classList.contains('dm-hidden');
+          await loadDynamicPlatforms();
+          const refreshed = state.dynamicPlatforms.flatMap(platform => platform.datasources || []).find(ds => ds.source_key === sourceKey);
+          if (refreshed) _currentDsEdit = refreshed;
+          if (detailWasOpen && refreshed) window.openDsDetail(sourceKey);
+          showToast('字段标准与权限已保存');
+          close();
+        } catch (e) {
+          showToast(e.message, true);
+          saveButton.disabled = false;
+          saveButton.textContent = oldLabel;
+        }
       });
     } catch (e) { ov.querySelector('#dmFrBody').innerHTML = '<p style="color:#f87171;">加载失败: ' + escapeHtml(e.message) + '</p>'; }
   }
@@ -3365,7 +3644,7 @@ renderPlatform(); updateGlobalStatus();
       try {
         const r = await apiFetch('/api/admin/user/' + uid + '/field-permissions?source_key=' + encodeURIComponent(sk));
         const restricted = r.restricted_fields || []; const granted = new Set(r.granted_fields || []);
-        if (!restricted.length) { target.innerHTML = '<span style="color:#94a3b8;font-size:12px;">该数据源暂无受限字段。可在"数据源管理 → 编辑 → 字段权限"中设置。</span>'; return; }
+        if (!restricted.length) { target.innerHTML = '<span style="color:#94a3b8;font-size:12px;">该数据源暂无受限字段。可在"数据源管理 → 编辑 → 字段标准与权限"中设置。</span>'; return; }
         target.innerHTML = `<div style="border:1px solid #e2e8f0;border-radius:12px;background:#fff;padding:12px 14px;">${
           restricted.map(f => `<label style="display:inline-flex;align-items:center;gap:6px;margin:4px 14px 4px 0;color:#0f172a;font-size:13px;"><input type="checkbox" class="ufg-field" value="${escapeHtml(f)}" ${granted.has(f) ? 'checked' : ''} style="accent-color:#3b82f6;">${escapeHtml(f)}</label>`).join('')
         }</div>`

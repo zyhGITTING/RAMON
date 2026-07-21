@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 PG_HOST = os.getenv("DATAMID_DB_HOST", "localhost")
 PG_PORT = int(os.getenv("DATAMID_DB_PORT", "5432"))
 PG_NAME = os.getenv("DATAMID_DB_NAME", "datamid")
-PG_USER = os.getenv("DATAMID_DB_USER", "datamid")
+PG_USER = os.getenv("DATAMID_DB_USER", "datamid_app")
 PG_PASSWORD = os.getenv("DATAMID_DB_PASSWORD", "")
 
 
@@ -29,6 +30,9 @@ class _PgCursor:
         return self._cur.rowcount
 
 
+import re
+
+
 class _PgConnection:
     __slots__ = ("_conn",)
 
@@ -37,7 +41,13 @@ class _PgConnection:
 
     @staticmethod
     def _translate(sql: str) -> str:
-        return sql.replace("?", "%s")
+        """Convert ? placeholders to psycopg2 %s, leaving ? inside string literals untouched."""
+        # Match either a placeholder or a single-quoted string (including escaped quotes).
+        return re.sub(
+            r"\?|('(?:''|[^'])*')",
+            lambda m: m.group(1) if m.group(1) else "%s",
+            sql,
+        )
 
     def execute(self, sql: str, params: Any = ()) -> _PgCursor:
         cur = self._conn.cursor()

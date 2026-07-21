@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.app.api.deps import require_admin
 from backend.app.db.connection import get_connection
@@ -43,10 +43,36 @@ def admin_stats(admin=Depends(require_admin)) -> dict[str, Any]:
 
 
 @router.api_route("/api/admin/user/list", methods=["GET", "POST"])
-def admin_user_list(admin=Depends(require_admin)) -> dict[str, Any]:
+def admin_user_list(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    keyword: str = Query("", max_length=100),
+    admin=Depends(require_admin),
+) -> dict[str, Any]:
     conn = get_connection()
     try:
-        return {"items": [serialize_user(row) for row in conn.execute("SELECT * FROM sys_user ORDER BY id").fetchall()]}
+        params: list[Any] = []
+        where_sql = ""
+        if keyword.strip():
+            pattern = f"%{keyword.strip().lower()}%"
+            where_sql = (
+                " WHERE LOWER(COALESCE(employee_no, '')) LIKE ?"
+                " OR LOWER(COALESCE(username, '')) LIKE ?"
+                " OR LOWER(COALESCE(full_name, '')) LIKE ?"
+                " OR LOWER(COALESCE(department, '')) LIKE ?"
+            )
+            params = [pattern, pattern, pattern, pattern]
+        total = int(conn.execute(f"SELECT COUNT(*) AS total FROM sys_user{where_sql}", params).fetchone()["total"])
+        rows = conn.execute(
+            f"SELECT * FROM sys_user{where_sql} ORDER BY id LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+        return {
+            "items": [serialize_user(row) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
     finally:
         conn.close()
 

@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.app.api.deps import require_admin
 from backend.app.db.connection import get_connection
@@ -20,9 +20,13 @@ from backend.app.services.llm_service import get_llm_service_by_id, request_llm_
 from backend.app.services.auth_service import verify_password
 from backend.app.services.datasource_service import (
     build_datasource_extra_config,
+    drop_business_time_index,
+    ensure_business_time_indexes,
+    get_business_columns,
     get_datasource_detail,
     get_datasource_map,
     normalize_field_label_map,
+    normalize_incremental_config,
     normalize_searchable_fields,
     parse_datasource_config,
     sanitize_request_config,
@@ -34,6 +38,19 @@ from backend.app.integrations.datasource_runtime import list_remote_rows
 from backend.app.services.sync_service import quote_identifier
 
 router = APIRouter()
+
+
+def _validate_incremental_config(config: dict[str, Any], business_time_field: str) -> dict[str, Any]:
+    normalized = normalize_incremental_config(config)
+    if not normalized.get("enabled"):
+        return normalized
+    if not business_time_field:
+        raise HTTPException(status_code=400, detail="开启增量同步必须先配置 business_time_field")
+    if str(normalized.get("strategy") or "").strip() != "date_range":
+        raise HTTPException(status_code=400, detail="增量同步目前只支持 strategy=date_range")
+    if str(normalized.get("merge_strategy") or "").strip() != "time_window_replace":
+        raise HTTPException(status_code=400, detail="增量同步目前只支持 merge_strategy=time_window_replace")
+    return normalized
 
 
 @router.post("/api/admin/datasource/test")
@@ -57,10 +74,35 @@ def admin_datasource_test(payload: DatasourceCreateRequest, admin=Depends(requir
 
 
 @router.api_route("/api/admin/datasource/list", methods=["GET", "POST"])
-def admin_datasource_list(admin=Depends(require_admin)) -> dict[str, Any]:
+def admin_datasource_list(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=500),
+    keyword: str = Query("", max_length=100),
+    admin=Depends(require_admin),
+) -> dict[str, Any]:
     conn = get_connection()
     try:
-        return {"items": [serialize_datasource(conn, row, admin) for row in conn.execute("SELECT * FROM sys_datasource ORDER BY id").fetchall()]}
+        params: list[Any] = []
+        where_sql = ""
+        if keyword.strip():
+            pattern = f"%{keyword.strip().lower()}%"
+            where_sql = (
+                " WHERE LOWER(COALESCE(source_key, '')) LIKE ?"
+                " OR LOWER(COALESCE(source_name, '')) LIKE ?"
+                " OR LOWER(COALESCE(table_name, '')) LIKE ?"
+            )
+            params = [pattern, pattern, pattern]
+        total = int(conn.execute(f"SELECT COUNT(*) AS total FROM sys_datasource{where_sql}", params).fetchone()["total"])
+        rows = conn.execute(
+            f"SELECT * FROM sys_datasource{where_sql} ORDER BY id LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+        return {
+            "items": [serialize_datasource(conn, row, admin) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
     finally:
         conn.close()
 
@@ -75,8 +117,11 @@ def admin_datasource_create(payload: DatasourceCreateRequest, admin=Depends(requ
         ).fetchone():
             raise HTTPException(status_code=400, detail="Datasource key or table name already exists")
         default_cfg = get_datasource_map().get(payload.source_key.strip(), {})
+        business_time_field = payload.business_time_field.strip()
+        incremental = _validate_incremental_config(payload.incremental_config or {}, business_time_field)
         extra = build_datasource_extra_config(
             description=payload.description.strip(),
+            business_time_field=business_time_field,
             chart_field=default_cfg.get("chart_field", ""),
             field_labels={
                 **(default_cfg.get("field_labels", {}) if isinstance(default_cfg.get("field_labels"), dict) else {}),
@@ -87,6 +132,7 @@ def admin_datasource_create(payload: DatasourceCreateRequest, admin=Depends(requ
             searchable_fields=normalize_searchable_fields(payload.searchable_fields),
             quality_rules=payload.quality_rules,
             verify_tls=payload.verify_tls,
+            incremental_config=incremental,
         )
         conn.execute(
             """
@@ -125,6 +171,17 @@ def admin_datasource_update(datasource_id: int, payload: DatasourceUpdateRequest
         config = parse_datasource_config(row)
         if payload.description is not None:
             config["description"] = payload.description.strip()
+        if payload.business_time_field is not None:
+            business_time_field = payload.business_time_field.strip()
+            previous_time_field = str(config.get("business_time_field") or "").strip()
+            if previous_time_field != business_time_field and table_exists(conn, row["table_name"]):
+                drop_business_time_index(conn, row["table_name"], previous_time_field)
+            if business_time_field and table_exists(conn, row["table_name"]):
+                available_columns = set(get_business_columns(conn, row))
+                if business_time_field not in available_columns:
+                    raise HTTPException(status_code=400, detail=f"Business time field not found: {business_time_field}")
+                ensure_business_time_indexes(conn, row["table_name"], business_time_field)
+            config["business_time_field"] = business_time_field
         if payload.searchable_fields is not None:
             config["searchable_fields"] = normalize_searchable_fields(payload.searchable_fields)
         if payload.quality_rules is not None:
@@ -141,6 +198,9 @@ def admin_datasource_update(datasource_id: int, payload: DatasourceUpdateRequest
             config["request"] = sanitize_request_config(row["source_key"], payload.request_config, payload.token or "")
         if payload.response_config is not None:
             config["response"] = payload.response_config
+        if payload.incremental_config is not None:
+            business_time_field = str(config.get("business_time_field") or "").strip()
+            config["incremental"] = _validate_incremental_config(payload.incremental_config, business_time_field)
         conn.execute(
             """
             UPDATE sys_datasource

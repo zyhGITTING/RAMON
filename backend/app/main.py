@@ -30,7 +30,7 @@ def _cors_allowed_origins() -> list[str]:
     return [origin.strip() for origin in os.getenv("DATAMID_CORS_ORIGINS", "").split(",") if origin.strip()]
 
 
-app = FastAPI(title="Datamid", version="2.1.0")
+app = FastAPI(title="Datamid", version="2.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_allowed_origins() or ["http://localhost:8128"],
@@ -93,6 +93,34 @@ def _migrate_mcp_token_config_columns() -> None:
         conn.execute("ALTER TABLE sys_mcp_token ADD COLUMN IF NOT EXISTS config_json_http TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE sys_mcp_token ADD COLUMN IF NOT EXISTS validity_period TEXT NOT NULL DEFAULT '3m'")
         conn.execute("ALTER TABLE sys_mcp_export_request ADD COLUMN IF NOT EXISTS validity_period TEXT NOT NULL DEFAULT '3m'")
+        # Keep every secret marker in the parameter tuple. Literal percent signs
+        # inside a psycopg2 query that also has parameters are interpreted by its
+        # pyformat parser and can crash application startup. POSITION also avoids
+        # LIKE wildcard semantics for the underscore in the `dmc_` prefix.
+        legacy_secret_condition = """
+            POSITION(? IN LOWER(COALESCE(config_json, ''))) > 0
+            OR POSITION(? IN LOWER(COALESCE(config_json_http, ''))) > 0
+        """
+        legacy_secret_markers = ("mcp_token=", "mcp_token=")
+        # Legacy exports embedded the complete credential in URLs/config JSON. Treat
+        # every affected active token as disclosed, revoke it, then remove the copy.
+        conn.execute(
+            f"""
+            UPDATE sys_mcp_token
+            SET status = 'revoked', revoked_at = ?, revoked_by = 'system',
+                revoked_reason = 'security_migration: credential stored in legacy config'
+            WHERE status = 'active' AND ({legacy_secret_condition})
+            """,
+            (now_text(), *legacy_secret_markers),
+        )
+        conn.execute(
+            f"""
+            UPDATE sys_mcp_token
+            SET config_json = '', config_json_http = ''
+            WHERE {legacy_secret_condition}
+            """,
+            legacy_secret_markers,
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -137,6 +165,9 @@ def _migrate_audit_log_enrichment_columns() -> None:
         ("source_name", "TEXT DEFAULT ''"),
         ("keyword", "TEXT DEFAULT ''"),
         ("as_of", "TEXT DEFAULT ''"),
+        ("start_time", "TEXT DEFAULT ''"),
+        ("end_time", "TEXT DEFAULT ''"),
+        ("business_time_field", "TEXT DEFAULT ''"),
         ("page", "INTEGER DEFAULT NULL"),
         ("page_size", "INTEGER DEFAULT NULL"),
         ("row_count", "INTEGER DEFAULT NULL"),
@@ -147,6 +178,7 @@ def _migrate_audit_log_enrichment_columns() -> None:
     try:
         for col, definition in new_columns:
             conn.execute(f"ALTER TABLE sys_audit_log ADD COLUMN IF NOT EXISTS {col} {definition}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_jti_created ON sys_audit_log(jti, created_at DESC)")
         conn.commit()
     except Exception:
         conn.rollback()

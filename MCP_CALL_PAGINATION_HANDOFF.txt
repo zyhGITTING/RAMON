@@ -1,0 +1,480 @@
+MCP 调用、服务端筛选、分页与 Token 导出问题交接说明
+========================================================
+
+用途
+----
+本文档用于交给 Claude Code，说明本项目 MCP 查询相关问题、已完成的本地修改、尚未实施的配置项、部署方式和验收标准。
+
+项目目录
+--------
+C:\Users\1202605003\Desktop\新建文件夹\Data Platform Deployment Package7.13
+
+重要操作约束
+------------
+1. 当前工作区已有较多未提交修改，不要 reset、checkout 或覆盖无关文件。
+2. 不要把本地 .env 直接覆盖到服务器；服务器已有数据库密码、Token 签名密钥等生产配置。
+3. 不要在代码、日志、文档或 URL 中写入真实 MCP Token。
+4. 用户曾在对话中暴露过旧 MCP Token，该 Token 必须停用并重新签发。
+5. MCP Token 只能通过 Authorization 请求头发送，不能继续使用 ?mcp_token=xxx。
+
+
+一、现象与根因
+==============
+
+问题 1：30 万行数据，Claw/其他 MCP 客户端只查看第一页
+------------------------------------------------------
+当前 MCP 查询默认 page=1、page_size=20，单次最大 page_size=200。
+
+旧行为不是只在前 20/200 行中搜索，而是：
+1. 如果调用方正确传入 keyword，数据库先执行 WHERE，再分页返回。
+2. 如果调用方没有传 keyword/filters，数据库返回无条件第一页。
+3. Claw 接收到第一页后，常常直接在这 20/200 行中本地查找，并错误地回答“没有找到”。
+4. Claw 不会自动遍历 30 万行；按 200 条/页遍历需要至少 1500 次调用，不适合放进模型上下文。
+
+因此核心问题不是简单提高 page_size，而是让调用方把查询条件传给服务端，由 PostgreSQL 在完整数据集中先筛选，再分页返回匹配结果。
+
+
+问题 2：用户说“查询某公司”，但 MCP 仍然只查第一页
+----------------------------------------------------
+自然语言中出现公司名称，不代表 Claw 实际把公司名称传入 MCP 参数。
+
+另外，旧 keyword 只搜索被标记为 searchable 的字段。如果“公司名称”字段没有标记为可搜索，keyword 即使有值也可能查不到。
+
+判断方式：查看 MCP 审计日志。
+
+如果看到：
+filters={}
+keyword=
+page=1
+page_size=20
+
+说明 Claw 根本没有把条件传给后端，只请求了第一页。
+
+
+问题 3：MCP 是否支持日期查询
+-----------------------------
+支持，但每个数据源必须配置 business_time_field（业务时间字段）。
+
+只有配置后，MCP tools/list 返回的工具参数中才会出现：
+- start_time
+- end_time
+
+注意：
+- start_time/end_time：按照数据记录自身的业务日期进行范围查询。
+- as_of：选择某个时间点之前的同步快照，不是记录日期。
+
+支持的日期格式：
+- YYYY-MM-DD
+- YYYY-MM-DD HH:MM
+- YYYY-MM-DD HH:MM:SS
+- YYYY-MM-DDTHH:MM:SS
+
+如果上游日期格式是 YYYYMMDD、DD/MM/YYYY 等，当前 SQL 日期表达式无法识别，需要额外做格式标准化。
+
+
+问题 4：审计日志 rule=rate:82/30 per min
+-------------------------------------------
+含义：同一个 MCP Token 的 jti 在最近滚动 1 分钟内已产生 82 次调用，超过 30 次/分钟阈值。
+
+当前默认配置：
+- mcp_anomaly_rate_per_min=30
+- mcp_anomaly_rows_per_hour=5000
+- mcp_anomaly_distinct_ip_per_hour=5
+- mcp_anomaly_action=alert_only
+
+alert_only 只记录告警，不阻断。如果 action 改成 revoke，达到阈值会自动停用 Token并返回 403。
+
+无条件遍历 30 万行会持续触发该告警，所以正确方案是服务端条件筛选或专用统计/导出，而不是让模型拉取全部分页。
+
+
+问题 5：MCP 导出配置出现 YOUR_SERVER
+------------------------------------
+真实公共地址是：
+http://172.17.111.60:8095/data_center
+
+原因：DATAMID_PUBLIC_URL 缺失时，docker-compose.yml 使用占位回退值：
+http://YOUR_SERVER/data_center
+
+本地 .env 已恢复：
+DATAMID_PUBLIC_URL=http://172.17.111.60:8095/data_center
+
+服务器也必须在自己的 .env 中配置该值，然后重新创建 backend 容器。不要用本地 .env 覆盖服务器 .env。
+
+
+问题 6：为什么历史 MCP 配置只显示 Bearer <MCP_TOKEN>
+-------------------------------------------------------
+这是安全设计：数据库只保存 Token 哈希和脱敏后的配置模板，不保存可恢复的明文 Token。
+
+首次导出成功的响应应显示真实 Token 一次；关闭后，历史“配置模板”只能显示：
+Authorization: Bearer <MCP_TOKEN>
+
+旧逻辑存在可用性缺陷：禁止重复导出，却让用户去历史列表查看，而历史列表无法恢复真实 Token。
+本地已增加“重新签发”功能解决此问题，详见下文。
+
+
+二、已经完成的本地代码修改
+==========================
+
+修改 A：通用结构化服务端过滤 filters
+------------------------------------
+涉及文件：
+- backend/app/api/routers/public_data.py
+- backend/app/services/datasource_query_service.py
+- backend/tests/test_mcp_structured_filters.py
+
+新增 MCP 参数：
+filters: object
+
+调用示例：
+{
+  "name": "query_srm_purchase_want_data",
+  "arguments": {
+    "filters": {
+      "公司名称": "目标公司",
+      "状态": "已审批"
+    },
+    "page": 1,
+    "page_size": 200
+  }
+}
+
+实现行为：
+1. filters 的键可使用数据库字段名、字段中文标签或标准字段名称。
+2. filters 最多 10 个字段。
+3. 多个 filters 条件之间为 AND。
+4. 当前匹配方式为 PostgreSQL ILIKE '%值%'，即不区分大小写的包含匹配。
+5. 服务端先对完整数据集执行 WHERE，再 COUNT 和分页。
+6. 隐藏字段或脱敏字段不能作为过滤条件，避免通过筛选推断受限信息。
+7. 未知字段返回 400，并给出当前用户可用的字段列表。
+8. MCP tools/list 会动态列出可过滤字段，并明确告诉模型：不得只读取第一页后声称没有找到。
+
+响应新增字段：
+- applied_filters：服务端实际应用的过滤条件
+- total_pages：过滤结果总页数
+- has_more：是否还有下一页
+- next_page：下一页页码；没有则为 null
+- query_guidance：提示模型当前是否只获得一页、是否已在全库过滤
+
+审计 detail 会记录 filters={...}，用于判断 Claw 是否正确传参。
+
+
+修改 B：keyword 改为 ILIKE
+--------------------------
+旧 keyword 使用 LIKE；本地改为 ILIKE，以便英文大小写不敏感。
+keyword 仍然只作用于配置/元数据中标记为可搜索且用户有 plain 权限的字段。
+
+建议：具体字段查询优先使用 filters；keyword 用于跨多个可搜索字段的 OR 模糊查询。
+
+
+修改 C：MCP 工具描述强化
+------------------------
+backend/app/api/routers/public_data.py 的工具说明已经明确：
+1. 用户指定公司、供应商、物料、单号等条件时，必须传 keyword 或 filters。
+2. 数据库会在完整数据集上先筛选。
+3. 禁止只读取第一页后判断没有找到。
+4. tools/list 会返回当前用户可见且未脱敏的字段名称和中文标签。
+
+
+修改 D：MCP Token 重新签发
+-------------------------
+涉及文件：
+- backend/app/api/routers/admin_mcp_token.py
+- backend/app/services/mcp_service.py
+- frontend/app.js
+- backend/tests/test_mcp_token_security.py
+
+新增接口：
+POST /api/mcp/token/{token_id}/reissue
+
+行为：
+1. 验证 Token 属于当前用户。
+2. 重新检查用户当前数据源权限。
+3. 立即停用旧 Token。
+4. 签发新 Token。
+5. 在本次响应中一次性返回包含真实 Token 的 SSE 和 HTTP 完整配置。
+6. 数据库只保存脱敏模板，不保存新 Token 明文。
+7. 响应设置 Cache-Control: no-store 和 Pragma: no-cache。
+
+前端“我的 MCP”列表新增“重新签发”按钮，并提供：
+- 复制 SSE 完整配置
+- 复制 HTTP 完整配置
+
+
+修改 E：Token 从 URL 参数迁移到 Authorization Header
+---------------------------------------------------
+旧格式（禁止继续使用）：
+http://host/data_center/api/mcp/data/source?mcp_token=dmc_xxx
+
+新格式：
+{
+  "mcpServers": {
+    "ramon-datamid": {
+      "url": "http://172.17.111.60:8095/data_center/api/mcp/data/srm_purchase_want_data",
+      "headers": {
+        "Authorization": "Bearer <新签发的真实Token>"
+      }
+    }
+  }
+}
+
+历史配置中发现完整凭据时，启动安全迁移会：
+- 自动停用受影响 Token
+- 清除 config_json/config_json_http 中的明文副本
+- revoked_reason 记录为：
+  security_migration: credential stored in legacy config
+
+
+修改 F：业务时间查询
+--------------------
+现有代码已支持单一 business_time_field：
+- 管理员在“数据源管理 -> 编辑 -> 业务时间字段”中选择字段。
+- 保存时验证字段是否存在，并创建表达式索引。
+- MCP tools/list 随后暴露 start_time/end_time。
+- 查询时先做时间 WHERE，再分页。
+
+公司 + 日期组合示例：
+{
+  "name": "query_srm_purchase_want_data",
+  "arguments": {
+    "filters": {
+      "公司名称": "目标公司"
+    },
+    "start_time": "2026-07-01",
+    "end_time": "2026-07-15",
+    "page": 1,
+    "page_size": 200
+  }
+}
+
+
+三、尚未实施的事项
+==================
+
+事项 1：MCP 默认 page_size 仍为 20
+--------------------------------
+重要：对话中讨论过把默认值改成 200，但截至本文档生成时，代码尚未统一实施该修改。
+
+当前状态：
+- MCP 默认 page_size=20
+- MCP 单次最大 page_size=200
+- 调用方显式传 page_size=200 时，可以一次返回最多 200 条匹配结果
+
+当前硬编码散布在 backend/app/api/routers/public_data.py 的：
+- MCP tools/list schema 和描述
+- tools/call arguments.get("page_size", 20)
+- max(1, min(..., 200)) 限制
+- 旧 GET MCP 接口 Query(20, ge=1, le=200)
+- 审计日志 page_size 记录
+- MCP 文档和示例
+
+建议 Claude Code 不要只机械替换数字，而是实现统一环境配置：
+
+DATAMID_MCP_DEFAULT_PAGE_SIZE=200
+DATAMID_MCP_MAX_PAGE_SIZE=200
+
+建议逻辑：
+1. MCP_MAX_PAGE_SIZE 至少为 1。
+2. MCP_DEFAULT_PAGE_SIZE 限制在 1..MCP_MAX_PAGE_SIZE。
+3. tools/list schema 的 default/maximum/description 使用同一常量。
+4. tools/call、GET MCP、审计记录、文档示例全部使用同一常量。
+5. 添加单元测试，避免以后某一处仍回退到 20。
+
+安全建议：员工信息等敏感数据不建议把最大值提高到数千或全部返回。默认/最大 200 较合理；精确查询应通过工号、姓名、部门等 filters 缩小结果。
+
+
+事项 2：filters 当前只有包含匹配和 AND
+--------------------------------------
+当前已实现：
+字段 ILIKE '%value%'，多个字段 AND。
+
+尚未实现但可能需要：
+- eq：精确等于
+- in：多个候选值
+- gt/gte/lt/lte：数值或日期比较
+- between：范围
+- OR 条件组
+- 任意日期字段范围，而不是每数据源只配置一个 business_time_field
+
+如果扩展，必须使用固定 DSL 并严格校验字段和操作符，禁止让客户端直接传 SQL。
+
+建议格式示例（仅建议，尚未实现）：
+{
+  "conditions": [
+    {"field": "公司名称", "op": "contains", "value": "目标公司"},
+    {"field": "状态", "op": "eq", "value": "已审批"},
+    {"field": "金额", "op": "gte", "value": 10000}
+  ]
+}
+
+
+事项 3：全量 30 万行不应通过模型分页搬运
+------------------------------------------
+如果业务要求完整导出，应新增：
+- 异步 CSV/Parquet 导出任务
+- 带权限和有效期的临时下载链接
+- 或基于 id 的游标分页接口
+
+不要通过 MCP 连续返回 1500 页给大模型。模型上下文、网络、数据库 COUNT/OFFSET 和审计日志都会承受不必要压力。
+
+
+事项 4：当前分页仍使用 OFFSET
+----------------------------
+查询 SQL 当前类似：
+ORDER BY id DESC LIMIT ? OFFSET ?
+
+越到后面的页，OFFSET 越大，性能越差。若存在深分页需求，建议改为游标分页：
+WHERE id < :last_id
+ORDER BY id DESC
+LIMIT :page_size
+
+并返回 next_cursor，而不是让调用方计算高页码。
+
+
+四、调用方正确使用方式
+======================
+
+场景 1：按员工工号查询
+--------------------
+{
+  "name": "query_employee_info",
+  "arguments": {
+    "filters": {
+      "工号": "10001"
+    },
+    "page": 1,
+    "page_size": 200
+  }
+}
+
+场景 2：按员工姓名和部门查询
+--------------------------
+{
+  "name": "query_employee_info",
+  "arguments": {
+    "filters": {
+      "员工姓名": "张三",
+      "部门": "财务"
+    },
+    "page": 1,
+    "page_size": 200
+  }
+}
+
+场景 3：按公司和日期查询
+----------------------
+{
+  "name": "query_srm_purchase_want_data",
+  "arguments": {
+    "filters": {
+      "公司名称": "目标公司"
+    },
+    "start_time": "2026-07-01",
+    "end_time": "2026-07-15",
+    "page": 1,
+    "page_size": 200
+  }
+}
+
+调用方提示词建议：
+查询用户指定的公司、员工、物料、单号或部门时，必须把条件放入 MCP 工具的 filters 参数，由服务端在完整数据集中筛选。不得获取无条件第一页后在本地查找，也不得仅凭第一页回答“没有找到”。如果响应 has_more=true 且业务确实需要更多匹配结果，使用 next_page 继续查询。
+
+
+五、服务器部署步骤
+==================
+
+至少需要同步的 MCP 相关文件：
+- backend/app/api/routers/public_data.py
+- backend/app/services/datasource_query_service.py
+- backend/app/api/routers/admin_mcp_token.py
+- backend/app/services/mcp_service.py
+- frontend/app.js
+
+如果同时部署安全迁移，还要核对：
+- backend/app/main.py
+
+测试文件不必上传生产服务器，但应保留在代码仓库：
+- backend/tests/test_mcp_structured_filters.py
+- backend/tests/test_mcp_token_security.py
+
+服务器 .env 必须保留原有生产秘密，并确认：
+DATAMID_PUBLIC_URL=http://172.17.111.60:8095/data_center
+
+不要把真实 MCP Token 写入 .env。
+
+在服务器部署目录执行：
+docker compose build backend
+docker compose up -d --no-deps --force-recreate backend
+docker compose logs --tail=100 backend
+
+注意：当前工作区 docker-compose.yml 还包含数据库角色和备份相关改动，并要求 DATAMID_DB_ADMIN_PASSWORD。如果服务器仍使用旧 compose，只上传 MCP 相关源码并用服务器现有 compose 构建；不要在没有核对数据库迁移变量的情况下直接覆盖整个 compose 文件。
+
+部署后：
+1. 让 Claw/Claude/MCP 客户端断开并重新连接 MCP。
+2. 必须重新执行 tools/list，才能看到新增 filters、字段列表和日期参数。
+3. 如果旧 Token 已暴露或被安全迁移停用，通过“我的 MCP -> 重新签发”生成新配置。
+4. 新 Token 放在 Authorization Header 中，不放在 URL。
+
+
+六、验收清单
+============
+
+功能验收
+--------
+[ ] tools/list 中 query_<source_key> 包含 filters 参数。
+[ ] filters 描述中列出当前用户可见字段及中文标签。
+[ ] 查询公司名称时审计日志出现 filters={"公司名称":"目标公司"} 或对应真实字段名。
+[ ] SQL 在完整当前版本数据上先 WHERE，再 LIMIT/OFFSET。
+[ ] 响应 applied_filters 与传入条件一致。
+[ ] 响应 total 是过滤后的总数，不是整个表总数。
+[ ] has_more/next_page/total_pages 正确。
+[ ] Claw 不再只扫描第一页后回答“没有找到”。
+[ ] 业务时间字段配置后，tools/list 出现 start_time/end_time。
+[ ] 公司 + 日期组合查询返回正确结果。
+
+权限与安全验收
+--------------
+[ ] 隐藏字段不能在 filters 中使用。
+[ ] 脱敏字段不能在 filters 中使用，防止旁路推断。
+[ ] 未知字段返回 400，不拼接原始 SQL。
+[ ] MCP Token 不出现在 URL、数据库明文配置或历史模板中。
+[ ] 首次签发/重新签发响应显示真实 Token 一次。
+[ ] 历史模板显示 <MCP_TOKEN>。
+[ ] 重新签发后旧 Token 立即失效。
+[ ] 响应含 Cache-Control: no-store。
+
+性能验收
+--------
+[ ] 在 30 万行数据上按公司/工号条件查询，记录 p50/p95。
+[ ] 检查 EXPLAIN ANALYZE，确认常用字段是否需要索引或 pg_trgm GIN 索引。
+[ ] 日期范围使用业务时间表达式索引。
+[ ] 深分页时评估 OFFSET 成本；必要时实现游标分页。
+[ ] 大批量调用不会意外触发 revoke；alert_only 告警符合预期。
+
+
+七、本地验证状态
+================
+
+最近一次本地验证结果：
+- Python 语法检查通过。
+- frontend/app.js 的 node --check 通过。
+- backend/tests 共 36 项测试通过。
+- git diff --check 无空白错误，仅有工作区 CRLF/LF 警告。
+
+由于本机 Docker Desktop 未运行，且本地 compose 缺少 DATAMID_DB_ADMIN_PASSWORD，尚未进行真实容器和 PostgreSQL 的端到端验证。生产部署前必须在测试/维护窗口执行实际 MCP 调用验证。
+
+
+八、给 Claude Code 的推荐下一步
+==============================
+
+优先级 P0：
+1. 保留现有 structured filters 和权限校验。
+2. 实现统一可配置的 MCP default/max page_size，消除散落的 20/200 硬编码。
+3. 为 tools/call 增加集成测试：确认 filters 真实进入 SQL 参数、过滤发生在 LIMIT 之前。
+4. 校验服务器 DATAMID_PUBLIC_URL 和新 Token Header 配置。
+
+优先级 P1：
+1. 为常用公司、员工、工号、单号字段评估 pg_trgm GIN 或精确索引。
+2. 增加游标分页，替代深 OFFSET。
+3. 增加安全的条件操作符 DSL（eq/in/range），禁止原始 SQL。
+4. 增加异步全量导出，避免通过模型搬运 30 万行。
+

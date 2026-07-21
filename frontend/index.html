@@ -45,9 +45,12 @@
 </script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>镭目科技 · 数据中台</title>
 <link rel="stylesheet" href="tailwind.css">
-<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="app.css?v=1.5.2">
 <script src="pako.min.js"></script>
 </head>
 <body class="flex min-h-screen">
@@ -274,6 +277,15 @@
               验证 TLS 证书
             </label>
             <div class="dm-form-row"><label>可搜索字段</label><input id="dmDeSearchable" placeholder="多个字段用逗号分隔，如 sq_no, prd_no, prd_name"></div>
+            <div class="dm-form-row"><label>业务时间字段</label><select id="dmDeBusinessTime"><option value="">— 不启用时间范围查询 —</option></select><span class="hint">字段值需为 ISO 日期或日期时间</span></div>
+            <div class="dm-form-row" style="align-items:center;"><label>增量同步</label><label style="display:flex;align-items:center;gap:6px;font-weight:400;"><input type="checkbox" id="dmDeIncrementalEnabled"> 启用按时间窗口增量同步</label></div>
+            <div id="dmDeIncrementalPanel" style="display:none;flex-direction:column;gap:0;">
+              <div class="dm-form-row"><label>增量策略</label><select id="dmDeIncrementalStrategy"><option value="date_range" selected>date_range</option></select></div>
+              <div class="dm-form-row"><label>合并方式</label><select id="dmDeIncrementalMergeStrategy"><option value="time_window_replace" selected>time_window_replace</option></select></div>
+              <div class="dm-form-row"><label>时间格式</label><select id="dmDeIncrementalFormat"><option value="date_string">date_string</option><option value="timestamp_ms">timestamp_ms</option></select></div>
+              <div class="dm-form-row"><label>回溯秒数</label><input id="dmDeIncrementalLookback" type="number" value="86400" min="0" step="60"></div>
+              <div class="dm-form-row"><label>首次起始日期</label><input id="dmDeIncrementalInitial" placeholder="YYYY-MM-DD，如 2026-01-01"></div>
+            </div>
             <div class="dm-form-row"><label>质量规则 JSON</label><textarea id="dmDeQualityRules" rows="7" placeholder='{"required_fields":["sq_no"],"unique_fields":["sq_no"]}' style="font-family:monospace;"></textarea></div>
           </div>
           <div style="display:flex;flex-direction:column;gap:0;">
@@ -284,7 +296,7 @@
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end;padding:14px 0 18px;border-top:1px solid #e2e8f0;background:#fff;position:sticky;bottom:0;">
         <button class="dm-btn danger" id="dmDeDelete" type="button">删除数据源</button>
-        <button class="dm-btn" id="dmDeFieldPerm" type="button" style="margin-right:auto;">字段权限</button>
+        <button class="dm-btn" id="dmDeFieldPerm" type="button" style="margin-right:auto;">字段标准与权限</button>
         <button class="dm-btn" id="dmDeCancel" type="button">取消</button>
         <button class="dm-btn primary" id="dmDeSave" type="button" onclick="window.handleDatasourceSave && window.handleDatasourceSave()">保存修改</button>
       </div>
@@ -515,7 +527,7 @@
 </div>
 
 <!-- ====== 平台占位（内容由登录后动态渲染） ====== -->
-<script src="app.js"></script>
+<script src="app.js?v=1.5.2"></script>
 
 <!-- ====== 数据中台管理 JS ====== -->
 </body>

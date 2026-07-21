@@ -142,6 +142,9 @@ CREATE TABLE IF NOT EXISTS sys_audit_log (
     source_name     TEXT DEFAULT '',
     keyword         TEXT DEFAULT '',
     as_of           TEXT DEFAULT '',
+    start_time      TEXT DEFAULT '',
+    end_time        TEXT DEFAULT '',
+    business_time_field TEXT DEFAULT '',
     page            INTEGER DEFAULT NULL,
     page_size       INTEGER DEFAULT NULL,
     row_count       INTEGER DEFAULT NULL,
@@ -150,6 +153,7 @@ CREATE TABLE IF NOT EXISTS sys_audit_log (
     accessed_fields TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_created_at ON sys_audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_jti_created ON sys_audit_log(jti, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS sys_config (
     id              SERIAL PRIMARY KEY,
@@ -262,11 +266,157 @@ CREATE INDEX IF NOT EXISTS idx_sys_mcp_export_request_user ON sys_mcp_export_req
 -- 涓変釜榛樿鏁版嵁婧?
 INSERT INTO sys_datasource (source_key, source_name, table_name, http_method, enabled)
 VALUES
-    ('erp_buy',      'ERP采购请购',   'ods_erp_buy',       'POST', 1),
-    ('stock',        '库存预警',      'ods_stock',         'POST', 1),
-    ('srm_purchase', 'SRM采购需求',   'ods_srm_purchase',  'POST', 1)
+    ('erp_buy',        'ERP采购请购',      'ods_erp_buy',         'POST', 1),
+    ('stock',          '库存预警',         'ods_stock',           'POST', 1),
+    ('srm_purchase',   'SRM采购需求',      'ods_srm_purchase',    'POST', 1),
+    ('erp_subcontract','ERP托工明细表',    'ods_erp_subcontract', 'POST', 1)
 ON CONFLICT (source_key) DO NOTHING;
 
 INSERT INTO sys_datasource (source_key, source_name, table_name, http_method, enabled)
 VALUES ('erp_safe_stock', 'ERP safe stock', 'ods_erp_safe_stock', 'POST', 1)
 ON CONFLICT (source_key) DO NOTHING;
+
+-- ==================== MCP 人均采购额改造：补充 5 个数据源的查询配置 ====================
+-- 这些源已存在但 extra_config 中 business_time_field 为空，需要补齐日期、排序、字段标签等配置
+
+UPDATE sys_datasource
+SET extra_config = COALESCE(extra_config, '{}'::jsonb) || '{
+    "business_time_field": "",
+    "chart_field": "fbm",
+    "field_labels": {
+        "yuangong_bh": "工号",
+        "fbm": "部门",
+        "fxm": "姓名",
+        "fzt": "员工状态",
+        "frzrq": "入职日期",
+        "fzxrq": "离职日期"
+    },
+    "searchable_fields": ["yuangong_bh", "fxm", "fbm"]
+}'::jsonb,
+    updated_at = NOW()
+WHERE source_key = 'new_employee_info';
+
+UPDATE sys_datasource
+SET extra_config = COALESCE(extra_config, '{}'::jsonb) || '{
+    "business_time_field": "os_dd",
+    "date_format": "timestamp_ms",
+    "stable_sort_fields": ["os_dd", "os_no", "itm"],
+    "chart_field": "cus_name",
+    "field_labels": {
+        "os_dd": "采购日期",
+        "sal_name": "采购员",
+        "qty": "数量",
+        "up": "单价",
+        "amt": "金额",
+        "amtn": "未税金额",
+        "os_no": "采购单号",
+        "itm": "行号",
+        "prd_no": "物料编码",
+        "prd_name": "物料名称",
+        "cus_name": "供应商"
+    },
+    "searchable_fields": ["os_no", "prd_no", "prd_name", "cus_name", "sal_name"]
+}'::jsonb,
+    updated_at = NOW()
+WHERE source_key = 'erp_purchase_order_detail';
+
+UPDATE sys_datasource
+SET extra_config = COALESCE(extra_config, '{}'::jsonb) || '{
+    "business_time_field": "os_dd",
+    "date_format": "timestamp_ms",
+    "stable_sort_fields": ["os_dd", "os_no", "itm"],
+    "chart_field": "sal_no_pona",
+    "field_labels": {
+        "os_dd": "采购日期",
+        "fx_name": "固定资产名称",
+        "qty": "数量",
+        "up": "单价",
+        "amt": "金额",
+        "amtn_net": "未税金额",
+        "os_no": "采购单号",
+        "itm": "行号",
+        "sal_no_pona": "业务员",
+        "sal_no_usena": "使用人",
+        "cus_name": "供应商"
+    },
+    "searchable_fields": ["os_no", "fx_name", "cus_name", "sal_no_pona"]
+}'::jsonb,
+    updated_at = NOW()
+WHERE source_key = 'erp_asset_purchase_detail';
+
+UPDATE sys_datasource
+SET extra_config = COALESCE(extra_config, '{}'::jsonb) || '{
+    "business_time_field": "tw_dd",
+    "date_format": "date_string",
+    "stable_sort_fields": ["tw_dd", "tw_no", "itm"],
+    "chart_field": "cus_name",
+    "field_labels": {
+        "tw_dd": "托工日期",
+        "usr": "制单人",
+        "qty_mrp": "制造数量",
+        "up": "外协单价",
+        "amtn": "加工金额",
+        "tw_no": "外协单号",
+        "itm": "行号",
+        "cus_name": "托工供应商",
+        "mrp_name": "托外货名称"
+    },
+    "searchable_fields": ["tw_no", "cus_name", "mrp_name", "usr"]
+}'::jsonb,
+    updated_at = NOW()
+WHERE source_key = 'erp_subcontract_detail';
+
+UPDATE sys_datasource
+SET extra_config = COALESCE(extra_config, '{}'::jsonb) || '{
+    "business_time_field": "ep_dd",
+    "date_format": "timestamp_ms",
+    "stable_sort_fields": ["ep_dd", "ep_no", "itm"],
+    "chart_field": "usr_name",
+    "field_labels": {
+        "ep_dd": "费用日期",
+        "ep_no": "费用单号",
+        "itm": "行号",
+        "usr_name": "报销人",
+        "amt": "金额",
+        "amtn": "未税金额",
+        "amtn_net": "净额",
+        "cus_name": "往来单位"
+    },
+    "searchable_fields": ["ep_no", "cus_name", "usr_name"]
+}'::jsonb,
+    updated_at = NOW()
+WHERE source_key = 'erp_other_expense_detail';
+
+-- 人均采购额相关表索引：日期/单号/行号稳定排序，人员表部门+工号
+CREATE INDEX IF NOT EXISTS idx_ods_erp_purchase_order_detail_date_doc ON ods_erp_purchase_order_detail ((os_dd::bigint), os_no, itm) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_ods_erp_asset_purchase_detail_date_doc ON ods_erp_asset_purchase_detail ((os_dd::bigint), os_no, itm) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_ods_erp_subcontract_detail_date_doc ON ods_erp_subcontract_detail (tw_dd, tw_no, itm) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_ods_other_expense_detail_date_doc ON ods_other_expense_detail ((ep_dd::bigint), ep_no, itm) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_ods_employee_info_dept_no ON ods_employee_info (fbm, yuangong_bh);
+
+-- ==================== 同步断点续传与增量同步扩展 ====================
+
+-- 每个数据源的同步断点/续传状态，失败或进程重启后从 last_fetched_page+1 继续
+CREATE TABLE IF NOT EXISTS sys_sync_checkpoint (
+    source_key             TEXT PRIMARY KEY,
+    sync_batch_id          TEXT NOT NULL DEFAULT '',
+    sync_version           TEXT NOT NULL DEFAULT '',
+    strategy               TEXT NOT NULL DEFAULT 'full',
+    status                 TEXT NOT NULL DEFAULT 'completed',
+    watermark_value        TEXT NOT NULL DEFAULT '',
+    cursor_value           TEXT NOT NULL DEFAULT '',
+    last_fetched_page      INTEGER NOT NULL DEFAULT 0,
+    last_fetched_row_count INTEGER NOT NULL DEFAULT 0,
+    failed_attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error             TEXT NOT NULL DEFAULT '',
+    start_date             TEXT NOT NULL DEFAULT '',
+    end_date               TEXT NOT NULL DEFAULT '',
+    started_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sync_checkpoint_status ON sys_sync_checkpoint(source_key, status);
+
+-- 记录每次同步使用的策略/水位，便于后续切换增量策略时追溯
+ALTER TABLE sys_sync_version
+    ADD COLUMN IF NOT EXISTS strategy TEXT NOT NULL DEFAULT 'full',
+    ADD COLUMN IF NOT EXISTS watermark_value TEXT NOT NULL DEFAULT '';

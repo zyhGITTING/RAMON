@@ -16,6 +16,9 @@ data/*.db
 *.sqlite
 *.sqlite3
 backup-*
+backups/
+*.dump
+*.dump.sha256
 *.bak
 
 # Logs and local OS/editor noise.

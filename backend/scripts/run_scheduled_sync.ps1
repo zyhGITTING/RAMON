@@ -27,7 +27,7 @@ if (-not $dbPassword) {
 $env:DATAMID_DB_HOST = "127.0.0.1"
 $env:DATAMID_DB_PORT = "5430"
 $env:DATAMID_DB_NAME = "datamid"
-$env:DATAMID_DB_USER = "datamid"
+$env:DATAMID_DB_USER = "datamid_app"
 $env:DATAMID_DB_PASSWORD = $dbPassword
 
 $envValue = [Environment]::GetEnvironmentVariable("DATAMID_RAMON_AUTH", "Process")

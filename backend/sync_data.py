@@ -10,14 +10,34 @@ from fastapi import HTTPException
 
 from backend.app.db.connection import get_connection
 from backend.app.db.repositories.config import now_text
-from backend.app.integrations.datasource_runtime import list_remote_rows
+from backend.app.db.repositories.sync_checkpoint import (
+    create_checkpoint,
+    get_checkpoint,
+    is_checkpoint_stale,
+    mark_checkpoint_completed,
+    mark_checkpoint_failed,
+    reset_checkpoint,
+    update_checkpoint_progress,
+)
+from backend.app.integrations.datasource_runtime import DatasourcePayloadError, iter_remote_pages
 from backend.app.services.datasource_service import (
+    append_ods_staging_rows,
+    compute_time_window_boundaries,
+    create_ods_staging_table,
+    discard_ods_staging_rows,
+    ensure_staging_table,
+    finalize_ods_staging_rows,
     get_datasource_detail,
-    get_table_row_count,
+    get_existing_staging_row_count,
+    get_time_window_row_count,
+    has_table_column,
+    merge_time_window_staging_rows,
     parse_datasource_config,
     prune_ods_table_versions,
-    replace_ods_table_rows,
+    prune_rejected_sync_versions,
     sync_datasource_field_meta,
+    table_exists,
+    truncate_staging_table,
 )
 from backend.app.services.sync_progress_service import (
     clear_sync_cancel_request,
@@ -27,6 +47,9 @@ from backend.app.services.sync_progress_service import (
     start_sync_progress,
     update_sync_progress_item,
 )
+
+
+_STALE_RESUME_HOURS = 24
 
 
 def _runtime_datasource(row: Any) -> dict[str, Any]:
@@ -42,24 +65,72 @@ def _runtime_datasource(row: Any) -> dict[str, Any]:
         "request_config": config.get("request", {}),
         "response_config": config.get("response", {}),
         "quality_rules": config.get("quality_rules", {}),
+        "business_time_field": config.get("business_time_field", ""),
+        "date_format": config.get("date_format", ""),
+        "incremental_config": config.get("incremental", {}),
     }
 
 
-def _evaluate_quality(row_count: int, previous_count: int, rules: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
-    change_rule = rules.get("row_count_change") if isinstance(rules, dict) and isinstance(rules.get("row_count_change"), dict) else {}
-    warn_ratio = float(change_rule.get("warn_ratio", 0.8) or 0.8)
+def _is_time_window_incremental(incremental_config: dict[str, Any] | None) -> bool:
+    if not incremental_config:
+        return False
+    if not incremental_config.get("enabled"):
+        return False
+    return (
+        str(incremental_config.get("strategy") or "").strip() == "date_range"
+        and str(incremental_config.get("merge_strategy") or "").strip() == "time_window_replace"
+    )
+
+
+def _quality_ratio(value: Any, default: float) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return default
+    return ratio if 0 <= ratio <= 1 else default
+
+
+def _evaluate_quality(
+    row_count: int,
+    previous_count: int,
+    rules: dict[str, Any],
+) -> tuple[str, dict[str, Any], str, bool]:
+    clean_rules = rules if isinstance(rules, dict) else {}
+    change_rule = clean_rules.get("row_count_change") if isinstance(clean_rules.get("row_count_change"), dict) else {}
+    # Backward compatibility: the old warn_ratio becomes the publish gate unless
+    # an administrator explicitly supplies reject_ratio/min_publish_ratio.
+    reject_ratio = _quality_ratio(
+        change_rule.get("reject_ratio", change_rule.get("min_publish_ratio", change_rule.get("warn_ratio", 0.8))),
+        0.8,
+    )
+    warn_ratio = max(reject_ratio, _quality_ratio(change_rule.get("warn_ratio", reject_ratio), reject_ratio))
+    allow_empty_publish = clean_rules.get("allow_empty_publish") is True
     ratio = None
     if previous_count > 0:
         ratio = row_count / previous_count
 
+    report = {
+        "row_count": row_count,
+        "previous_row_count": previous_count,
+        "ratio": ratio,
+        "reject_ratio": reject_ratio,
+        "warn_ratio": warn_ratio,
+        "allow_empty_publish": allow_empty_publish,
+    }
     if row_count == 0:
-        summary = "No rows returned"
-        return "empty", {"summary": summary, "row_count": row_count, "previous_row_count": previous_count, "ratio": ratio}, summary
+        if allow_empty_publish:
+            summary = "Published an empty snapshot by explicit datasource policy"
+            return "empty", {**report, "summary": summary, "published": True, "reason_code": "empty_allowed"}, summary, True
+        summary = "Rejected empty snapshot; last-known-good remains current"
+        return "rejected", {**report, "summary": summary, "published": False, "reason_code": "empty_snapshot"}, summary, False
+    if ratio is not None and ratio < reject_ratio:
+        summary = f"Rejected row-count drop to {row_count} from {previous_count}; last-known-good remains current"
+        return "rejected", {**report, "summary": summary, "published": False, "reason_code": "row_count_drop"}, summary, False
     if ratio is not None and ratio < warn_ratio:
-        summary = f"Row count dropped to {row_count} from {previous_count}"
-        return "warning", {"summary": summary, "row_count": row_count, "previous_row_count": previous_count, "ratio": ratio}, summary
+        summary = f"Published with warning: row count dropped to {row_count} from {previous_count}"
+        return "warning", {**report, "summary": summary, "published": True, "reason_code": "row_count_warning"}, summary, True
     summary = f"Synced {row_count} rows"
-    return "success", {"summary": summary, "row_count": row_count, "previous_row_count": previous_count, "ratio": ratio}, summary
+    return "success", {**report, "summary": summary, "published": True, "reason_code": "accepted"}, summary, True
 
 
 def _load_target_datasources(conn: Any, source_key: str | None) -> list[Any]:
@@ -78,6 +149,75 @@ def _load_target_datasources(conn: Any, source_key: str | None) -> list[Any]:
     ).fetchall()
 
 
+def _staging_table_name(table_name: str) -> str:
+    return f"stg_{table_name}"
+
+
+def _prepare_sync_batch(
+    conn,
+    live_row: Any,
+    runtime_ds: dict[str, Any],
+    triggered_by: str,
+) -> tuple[str, str, str, int, int, dict[str, Any] | None]:
+    """Return (sync_batch_id, sync_version, staging_name, start_page, resumed_row_count, window)."""
+    source = runtime_ds["source_key"]
+    table_name = live_row["table_name"]
+    staging_name = _staging_table_name(table_name)
+    incremental_config = runtime_ds.get("incremental_config") or {}
+    strategy = "full" if not incremental_config.get("enabled") else str(incremental_config.get("strategy") or "full")
+    is_time_window = _is_time_window_incremental(incremental_config)
+    window: dict[str, Any] | None = None
+
+    checkpoint = get_checkpoint(conn, source)
+    if checkpoint and checkpoint.get("status") in {"running", "failed"} and not is_checkpoint_stale(checkpoint, _STALE_RESUME_HOURS):
+        existing_batch = str(checkpoint.get("sync_batch_id") or "").strip()
+        existing_version = str(checkpoint.get("sync_version") or "").strip()
+        existing_staging = _staging_table_name(table_name)
+        if existing_batch and existing_version and table_exists(conn, existing_staging):
+            # Resume from the last successfully committed page.
+            start_page = int(checkpoint.get("last_fetched_page") or 0) + 1
+            resumed_row_count = int(checkpoint.get("last_fetched_row_count") or 0)
+            # Verify the staging table really belongs to this batch.
+            staged_count = get_existing_staging_row_count(conn, existing_staging, existing_batch)
+            if staged_count > 0:
+                ensure_staging_table(conn, table_name, existing_staging)
+                if is_time_window:
+                    window = compute_time_window_boundaries(incremental_config, checkpoint)
+                create_checkpoint(
+                    conn,
+                    source,
+                    existing_batch,
+                    existing_version,
+                    strategy=strategy,
+                    start_date=window["start_date"] if window else "",
+                    end_date=window["end_date"] if window else "",
+                )
+                return existing_batch, existing_version, existing_staging, start_page, resumed_row_count, window
+
+    # Fresh start: reset checkpoint and truncate any leftover staging.
+    reset_checkpoint(conn, source, strategy=strategy)
+    if table_exists(conn, staging_name):
+        truncate_staging_table(conn, staging_name)
+    else:
+        create_ods_staging_table(conn, table_name, staging_name, durable=True)
+
+    started_at = now_text()
+    sync_batch_id = uuid.uuid4().hex
+    sync_version = f"{started_at.replace('-', '').replace(':', '').replace(' ', '')}_{uuid.uuid4().hex[:8]}"
+    if is_time_window:
+        window = compute_time_window_boundaries(incremental_config, checkpoint)
+    create_checkpoint(
+        conn,
+        source,
+        sync_batch_id,
+        sync_version,
+        strategy=strategy,
+        start_date=window["start_date"] if window else "",
+        end_date=window["end_date"] if window else "",
+    )
+    return sync_batch_id, sync_version, staging_name, 1, 0, window
+
+
 def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
     source = row["source_key"]
     name = row["source_name"]
@@ -85,6 +225,13 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
     started_perf = time.perf_counter()
     sync_version = ""
     failed_sync_version = ""
+    sync_batch_id = ""
+    staging_name = ""
+    window: dict[str, Any] | None = None
+    strategy = "full"
+    row_count = 0
+    reported_total: int | None = None
+    last_page = 0
     update_sync_progress_item(
         source,
         source_name=name,
@@ -102,11 +249,85 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
             live_row = get_datasource_detail(conn, source, include_disabled=False)
             if not live_row:
                 raise HTTPException(status_code=404, detail="Datasource not found or disabled")
-            previous_count = get_table_row_count(conn, live_row["table_name"])
+            previous_version = conn.execute(
+                """
+                SELECT row_count
+                FROM sys_sync_version
+                WHERE source_key = ? AND is_current = 1
+                ORDER BY finished_at DESC, id DESC
+                LIMIT 1
+                """,
+                (source,),
+            ).fetchone()
+            previous_count = int(previous_version["row_count"] or 0) if previous_version else 0
             runtime_ds = _runtime_datasource(live_row)
 
-            def _progress(page: int, batch_size: int, fetched: int, reported_total: int | None, has_next: bool | None) -> None:
-                total_for_progress = reported_total if reported_total not in (None, 0) else max(fetched, batch_size)
+            sync_batch_id, sync_version, staging_name, start_page, resumed_row_count, window = _prepare_sync_batch(
+                conn,
+                live_row,
+                runtime_ds,
+                triggered_by,
+            )
+            conn.commit()
+
+            if window:
+                # Make a mutable copy so we can attach the precomputed window.
+                runtime_ds = {**runtime_ds}
+                runtime_ds["incremental_config"] = {**runtime_ds.get("incremental_config", {}), **window}
+                business_time_field = runtime_ds.get("business_time_field", "")
+                if (
+                    business_time_field
+                    and table_exists(conn, live_row["table_name"])
+                    and has_table_column(conn, live_row["table_name"], business_time_field)
+                ):
+                    previous_count = get_time_window_row_count(
+                        conn,
+                        live_row["table_name"],
+                        business_time_field,
+                        runtime_ds.get("date_format", ""),
+                        window["start_date"],
+                        window["end_date"],
+                    )
+                else:
+                    previous_count = 0
+            else:
+                previous_count = int(previous_version["row_count"] or 0) if previous_version else 0
+
+            incremental_config = runtime_ds.get("incremental_config") or {}
+            strategy = str(incremental_config.get("strategy") or "full") if incremental_config.get("enabled") else "full"
+
+            for page, rows, page_total, has_next in iter_remote_pages(
+                runtime_ds,
+                should_stop=is_sync_cancel_requested,
+                start_page=start_page,
+                sequential=True,
+            ):
+                if is_sync_cancel_requested():
+                    raise RuntimeError("Sync cancelled")
+                append_ods_staging_rows(
+                    conn,
+                    live_row["table_name"],
+                    staging_name,
+                    rows,
+                    sync_batch_id,
+                    sync_version,
+                    runtime_ds.get("business_time_field", ""),
+                    sync_page=page,
+                )
+                conn.commit()
+                # Update progress after commit so checkpoint and staging are consistent.
+                row_count += len(rows)
+                update_checkpoint_progress(
+                    conn,
+                    source,
+                    page=page,
+                    row_count=resumed_row_count + row_count,
+                )
+                conn.commit()
+                last_page = page
+                if page_total is not None:
+                    reported_total = page_total
+                total_for_progress = reported_total if reported_total not in (None, 0) else max(resumed_row_count + row_count, len(rows))
                 suffix = f"page {page}"
                 if has_next is True:
                     suffix += " (more)"
@@ -114,33 +335,53 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
                     source,
                     source_name=name,
                     status="syncing",
-                    fetched=fetched,
+                    fetched=resumed_row_count + row_count,
                     total=total_for_progress,
                     page=page,
-                    row_count=fetched,
-                    message=f"Fetched {fetched} rows, {suffix}",
+                    row_count=resumed_row_count + row_count,
+                    message=f"Staged {resumed_row_count + row_count} rows, {suffix}",
                     quality_status="",
                     quality_summary="",
                 )
-
-            rows, reported_total = list_remote_rows(
-                runtime_ds,
-                progress_callback=_progress,
-                should_stop=is_sync_cancel_requested,
-            )
             if is_sync_cancel_requested():
                 raise RuntimeError("Sync cancelled")
 
-            sync_batch_id = uuid.uuid4().hex
-            sync_version = f"{started_at.replace('-', '').replace(':', '').replace(' ', '')}_{uuid.uuid4().hex[:8]}"
-            replace_ods_table_rows(conn, live_row["table_name"], rows, sync_batch_id, sync_version)
-            sync_datasource_field_meta(conn, live_row)
-            row_count = len(rows)
-            quality_status, quality_report, quality_summary = _evaluate_quality(
-                row_count,
+            total_row_count = resumed_row_count + row_count
+            # Candidate quality is decided before any current flag is changed.
+            quality_status, quality_report, quality_summary, publish_candidate = _evaluate_quality(
+                total_row_count,
                 previous_count,
                 runtime_ds.get("quality_rules", {}),
             )
+            if publish_candidate:
+                if window:
+                    merge_time_window_staging_rows(
+                        conn,
+                        live_row["table_name"],
+                        staging_name,
+                        runtime_ds.get("business_time_field", ""),
+                        runtime_ds.get("date_format", ""),
+                        window["start_date"],
+                        window["end_date"],
+                    )
+                else:
+                    finalize_ods_staging_rows(conn, live_row["table_name"], staging_name)
+                discard_ods_staging_rows(conn, staging_name)
+                sync_datasource_field_meta(conn, live_row)
+                mark_checkpoint_completed(conn, source)
+                if window:
+                    update_checkpoint_progress(
+                        conn,
+                        source,
+                        page=last_page,
+                        row_count=total_row_count,
+                        watermark_value=window["end_date"],
+                    )
+            else:
+                # Rejected candidate data stays in a temporary table only and is
+                # deleted immediately. The existing current snapshot is untouched.
+                discard_ods_staging_rows(conn, staging_name)
+                reset_checkpoint(conn, source)
             finished_at = now_text()
             duration_ms = int((time.perf_counter() - started_perf) * 1000)
             conn.execute(
@@ -174,7 +415,7 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
                     sync_version,
                     quality_status,
                     quality_summary,
-                    row_count,
+                    total_row_count,
                     started_at,
                     finished_at,
                     duration_ms,
@@ -183,14 +424,15 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
                     json.dumps(quality_report, ensure_ascii=False),
                 ),
             )
-            conn.execute("UPDATE sys_sync_version SET is_current = 0 WHERE source_key = ?", (live_row["source_key"],))
+            if publish_candidate:
+                conn.execute("UPDATE sys_sync_version SET is_current = 0 WHERE source_key = ?", (live_row["source_key"],))
             conn.execute(
                 """
                 INSERT INTO sys_sync_version (
                     source_key, source_name, table_name, sync_version, sync_batch_id,
                     status, message, row_count, started_at, finished_at, duration_ms,
-                    triggered_by, quality_status, quality_report, is_current
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    triggered_by, quality_status, quality_report, is_current, strategy, watermark_value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     live_row["source_key"],
@@ -200,27 +442,37 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
                     sync_batch_id,
                     quality_status,
                     quality_summary,
-                    row_count,
+                    total_row_count,
                     started_at,
                     finished_at,
                     duration_ms,
                     triggered_by,
                     quality_status,
                     json.dumps(quality_report, ensure_ascii=False),
+                    1 if publish_candidate else 0,
+                    strategy,
+                    window["end_date"] if window else "",
                 ),
             )
-            prune_ods_table_versions(conn, live_row["source_key"], live_row["table_name"])
+            if publish_candidate:
+                if window:
+                    # 增量同步的 ODS 行来自多个窗口，不能按版本 prune。
+                    prune_rejected_sync_versions(conn, live_row["source_key"])
+                else:
+                    prune_ods_table_versions(conn, live_row["source_key"], live_row["table_name"])
+            else:
+                prune_rejected_sync_versions(conn, live_row["source_key"])
             conn.commit()
 
-        progress_status = quality_status if quality_status in {"warning", "empty"} else "success"
+        progress_status = quality_status if quality_status in {"warning", "empty", "rejected"} else "success"
         update_sync_progress_item(
             source,
             source_name=name,
             status=progress_status,
-            fetched=row_count,
-            total=reported_total or row_count,
-            page=1,
-            row_count=row_count,
+            fetched=resumed_row_count + row_count,
+            total=reported_total or (resumed_row_count + row_count),
+            page=last_page,
+            row_count=resumed_row_count + row_count,
             message=quality_summary,
             quality_status=quality_status,
             quality_summary=quality_report.get("summary", ""),
@@ -231,22 +483,42 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
             "source_name": name,
             "status": progress_status,
             "sync_version": sync_version,
-            "row_count": row_count,
-            "fetched": row_count,
-            "total": reported_total or row_count,
+            "row_count": resumed_row_count + row_count,
+            "fetched": resumed_row_count + row_count,
+            "total": reported_total or (resumed_row_count + row_count),
             "message": quality_summary,
             "quality_status": quality_status,
             "quality_summary": quality_report.get("summary", ""),
             "_summary_key": quality_status,
         }
     except Exception as exc:
-        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        detail = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+        is_rejected = isinstance(exc, DatasourcePayloadError)
+        outcome_status = "rejected" if is_rejected else "failed"
+        outcome_row_count = row_count if is_rejected else 0
+        failed_sync_version = sync_version or f"{started_at.replace('-', '').replace(':', '').replace(' ', '')}_{uuid.uuid4().hex[:8]}"
+        quality_report = {
+            "summary": detail,
+            "published": False,
+            "reason_code": exc.reason_code if is_rejected else "sync_failed",
+            "page": exc.page if is_rejected else None,
+            "row_count": outcome_row_count,
+        }
         finished_at = now_text()
         duration_ms = int((time.perf_counter() - started_perf) * 1000)
         with get_connection() as conn:
+            # For retriable failures we keep the staging table and checkpoint so the
+            # next run can resume. For rejected payloads or non-retriable errors we
+            # discard the candidate and reset the checkpoint.
+            if staging_name:
+                if is_rejected:
+                    discard_ods_staging_rows(conn, staging_name)
+                    reset_checkpoint(conn, source)
+                else:
+                    mark_checkpoint_failed(conn, source, detail)
+                conn.commit()
             live_row = get_datasource_detail(conn, source, include_disabled=True)
             if live_row:
-                failed_sync_version = f"{started_at.replace('-', '').replace(':', '').replace(' ', '')}_{uuid.uuid4().hex[:8]}"
                 conn.execute(
                     """
                     UPDATE sys_datasource
@@ -256,10 +528,10 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
                     """,
                     (
                         finished_at,
-                        "failed",
+                        outcome_status,
                         detail,
-                        "failed",
-                        json.dumps({"summary": detail}, ensure_ascii=False),
+                        outcome_status,
+                        json.dumps(quality_report, ensure_ascii=False),
                         finished_at,
                         live_row["id"],
                     ),
@@ -276,15 +548,15 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
                         live_row["source_name"],
                         live_row["table_name"],
                         failed_sync_version,
-                        "failed",
+                        outcome_status,
                         detail,
-                        0,
+                        outcome_row_count,
                         started_at,
                         finished_at,
                         duration_ms,
                         triggered_by,
-                        "failed",
-                        json.dumps({"summary": detail}, ensure_ascii=False),
+                        outcome_status,
+                        json.dumps(quality_report, ensure_ascii=False),
                     ),
                 )
                 conn.execute(
@@ -292,52 +564,56 @@ def _sync_one_datasource(row: Any, triggered_by: str) -> dict[str, Any]:
                     INSERT INTO sys_sync_version (
                         source_key, source_name, table_name, sync_version, sync_batch_id,
                         status, message, row_count, started_at, finished_at, duration_ms,
-                        triggered_by, quality_status, quality_report, is_current
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        triggered_by, quality_status, quality_report, is_current, strategy, watermark_value
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                     """,
                     (
                         live_row["source_key"],
                         live_row["source_name"],
                         live_row["table_name"],
                         failed_sync_version,
-                        "",
-                        "failed",
+                        sync_batch_id if is_rejected else "",
+                        outcome_status,
                         detail,
-                        0,
+                        outcome_row_count,
                         started_at,
                         finished_at,
                         duration_ms,
                         triggered_by,
-                        "failed",
-                        json.dumps({"summary": detail}, ensure_ascii=False),
+                        outcome_status,
+                        json.dumps(quality_report, ensure_ascii=False),
+                        strategy,
+                        window["end_date"] if window else "",
                     ),
                 )
-                conn.commit()
+                if is_rejected:
+                    prune_rejected_sync_versions(conn, live_row["source_key"])
+            conn.commit()
         update_sync_progress_item(
             source,
             source_name=name,
-            status="failed",
-            fetched=0,
-            total=None,
-            page=1,
-            row_count=0,
+            status=outcome_status,
+            fetched=outcome_row_count,
+            total=reported_total if is_rejected else None,
+            page=last_page or 1,
+            row_count=outcome_row_count,
             message=detail,
-            quality_status="failed",
+            quality_status=outcome_status,
             quality_summary=detail,
             sync_version=failed_sync_version,
         )
         return {
             "source_key": source,
             "source_name": name,
-            "status": "failed",
+            "status": outcome_status,
             "sync_version": failed_sync_version,
-            "row_count": 0,
-            "fetched": 0,
-            "total": None,
+            "row_count": outcome_row_count,
+            "fetched": outcome_row_count,
+            "total": reported_total if is_rejected else None,
             "message": detail,
-            "quality_status": "failed",
+            "quality_status": outcome_status,
             "quality_summary": detail,
-            "_summary_key": "failed",
+            "_summary_key": outcome_status,
         }
 
 
@@ -350,7 +626,7 @@ def run_sync(source_key: str | None = None, triggered_by: str = "system") -> dic
     start_sync_progress(datasources)
 
     finished_items: list[dict[str, Any]] = []
-    summary = {"success": 0, "empty": 0, "warning": 0, "failed": 0, "total": len(datasources)}
+    summary = {"success": 0, "empty": 0, "warning": 0, "rejected": 0, "failed": 0, "total": len(datasources)}
     result_error = ""
 
     try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from backend.app.db.repositories.config import get_config
 from backend.app.services.auth_service import _decode_signed_token, _sign_payload
 from backend.app.services.llm_service import parse_json_array
 from backend.app.services.permission_service import has_source_permission
@@ -21,6 +23,13 @@ MCP_VALIDITY_PERIODS = {
 }
 MCP_PERMANENT_EXP_TS = 253402271999
 MCP_PERMANENT_EXPIRES_AT = "9999-12-31 23:59:59"
+MCP_TOKEN_PLACEHOLDER = "<MCP_TOKEN>"
+MCP_ANOMALY_DEFAULTS = {
+    "mcp_anomaly_rate_per_min": "30",
+    "mcp_anomaly_rows_per_hour": "5000",
+    "mcp_anomaly_distinct_ip_per_hour": "5",
+    "mcp_anomaly_action": "alert_only",
+}
 
 
 def now_text() -> str:
@@ -143,10 +152,52 @@ def issue_mcp_token(conn, user, source_keys: list[str], bind_ip: bool, ip: str, 
     }
 
 
+def sanitize_mcp_config(config_json: str) -> str:
+    """Return a reusable config template without retaining an MCP credential."""
+    raw = str(config_json or "").strip()
+    if not raw:
+        return ""
+
+    def redact(value: Any, key: str = "") -> Any:
+        if isinstance(value, dict):
+            return {item_key: redact(item_value, str(item_key)) for item_key, item_value in value.items()}
+        if isinstance(value, list):
+            return [redact(item, key) for item in value]
+        if not isinstance(value, str):
+            return value
+
+        key_lower = key.strip().lower()
+        if key_lower == "authorization":
+            return f"Bearer {MCP_TOKEN_PLACEHOLDER}"
+        if key_lower in {"mcp_token", "token", "access_token"}:
+            return MCP_TOKEN_PLACEHOLDER
+
+        def remove_query_secret(match: re.Match[str]) -> str:
+            return match.group(1) if match.group(2) else ""
+
+        cleaned = re.sub(
+            r"([?&])(?:mcp_token|token)=[^&#\s\"']*(&?)",
+            remove_query_secret,
+            value,
+            flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.replace("?&", "?").rstrip("?&")
+        cleaned = re.sub(r"Bearer\s+dmc_[A-Za-z0-9._~-]+", f"Bearer {MCP_TOKEN_PLACEHOLDER}", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"dmc_[A-Za-z0-9._~-]+", MCP_TOKEN_PLACEHOLDER, cleaned)
+        return cleaned
+
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return str(redact(raw))
+    return json.dumps(redact(parsed), ensure_ascii=False, indent=2)
+
+
 def update_mcp_token_configs(conn, token_id: int, config_json: str = "", config_json_http: str = "") -> None:
+    """Persist full configs including the token so users can re-view usable configs later."""
     conn.execute(
         "UPDATE sys_mcp_token SET config_json = ?, config_json_http = ? WHERE id = ?",
-        (config_json or "", config_json_http or "", token_id),
+        (str(config_json or ""), str(config_json_http or ""), token_id),
     )
 
 
@@ -179,6 +230,99 @@ def validate_mcp_token_record(conn, token: str, payload: dict[str, Any], source_
     return row
 
 
+def record_mcp_rejection(payload: dict[str, Any], source_key: str, ip: str, reason: str) -> None:
+    from backend.app.db.repositories.audit import record_audit_log
+
+    record_audit_log(
+        payload.get("username", "unknown"),
+        "user",
+        "mcp_token_rejected",
+        source_key,
+        f"reason={reason};jti={payload.get('jti') or ''}",
+        ip,
+        user_id=int(payload.get("uid") or 0) or None,
+        employee_no=payload.get("employee_no") or "",
+        department=payload.get("department") or "",
+        jti=payload.get("jti") or "",
+    )
+
+
+def _get_int_config(conn, key: str) -> int:
+    default = MCP_ANOMALY_DEFAULTS[key]
+    try:
+        return int(get_config(conn, key, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def check_mcp_token_anomaly(conn, token_row, payload: dict[str, Any], source_key: str, ip: str) -> None:
+    jti = str(payload.get("jti") or "").strip()
+    if not jti:
+        return
+
+    rate_limit = _get_int_config(conn, "mcp_anomaly_rate_per_min")
+    rows_limit = _get_int_config(conn, "mcp_anomaly_rows_per_hour")
+    ip_limit = _get_int_config(conn, "mcp_anomaly_distinct_ip_per_hour")
+    action = get_config(conn, "mcp_anomaly_action", MCP_ANOMALY_DEFAULTS["mcp_anomaly_action"]).strip().lower()
+
+    minute_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM sys_audit_log
+        WHERE jti = ? AND action IN ('mcp_tool_call', 'mcp_query')
+          AND created_at > NOW() - INTERVAL '1 minute'
+        """,
+        (jti,),
+    ).fetchone()["c"]
+    hour_row = conn.execute(
+        """
+        SELECT COALESCE(SUM(row_count), 0) AS rows_sum, COUNT(DISTINCT ip) AS ip_count
+        FROM sys_audit_log
+        WHERE jti = ? AND action IN ('mcp_tool_call', 'mcp_query')
+          AND created_at > NOW() - INTERVAL '1 hour'
+        """,
+        (jti,),
+    ).fetchone()
+
+    triggered = None
+    if int(minute_count or 0) >= rate_limit:
+        triggered = f"rate:{minute_count}/{rate_limit} per min"
+    elif int(hour_row["rows_sum"] or 0) >= rows_limit:
+        triggered = f"rows:{hour_row['rows_sum']}/{rows_limit} per hour"
+    elif int(hour_row["ip_count"] or 0) >= ip_limit:
+        triggered = f"distinct_ip:{hour_row['ip_count']}/{ip_limit} per hour"
+
+    if not triggered:
+        return
+
+    from backend.app.db.repositories.audit import record_audit_log
+
+    record_audit_log(
+        payload.get("username", "unknown"),
+        "user",
+        "mcp_anomaly_detected",
+        source_key,
+        f"rule={triggered};jti={jti};action={action}",
+        ip,
+        user_id=int(payload.get("uid") or 0) or None,
+        employee_no=payload.get("employee_no") or "",
+        department=payload.get("department") or "",
+        token_id=int(token_row["id"]) if token_row is not None else None,
+        jti=jti,
+    )
+    if action == "revoke":
+        conn.execute(
+            """
+            UPDATE sys_mcp_token
+            SET status = 'revoked', revoked_at = ?, revoked_by = ?, revoked_reason = ?
+            WHERE jti = ? AND status = 'active'
+            """,
+            (now_text(), "system", f"auto: {triggered}", jti),
+        )
+        conn.commit()
+        raise HTTPException(status_code=403, detail="MCP token auto-revoked due to abnormal usage pattern, please contact admin")
+
+
 def serialize_mcp_token_row(row) -> dict[str, Any]:
     source_keys = parse_json_array(row["source_keys_json"])
     return {
@@ -207,8 +351,8 @@ def serialize_mcp_token_row(row) -> dict[str, Any]:
         "deleted_at": row["deleted_at"] or "",
         "deleted_by": row["deleted_by"] or "",
         "deleted_reason": row["deleted_reason"] or "",
-        "config_json": row.get("config_json") or "",
-        "config_json_http": row.get("config_json_http") or "",
+        "config_json": sanitize_mcp_config(row.get("config_json") or ""),
+        "config_json_http": sanitize_mcp_config(row.get("config_json_http") or ""),
     }
 
 

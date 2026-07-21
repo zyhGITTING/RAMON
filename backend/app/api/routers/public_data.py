@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import queue
@@ -14,18 +15,38 @@ from fastapi.security import HTTPAuthorizationCredentials
 from starlette.responses import Response, StreamingResponse
 
 from backend.app.api.deps import get_current_user
-from backend.app.core.config import APP_PORT
+from backend.app.core.config import APP_PORT, MCP_DEFAULT_PAGE_SIZE, MCP_MAX_PAGE_SIZE
 from backend.app.db.connection import get_connection
 from backend.app.db.repositories.audit import record_audit_log
 from backend.app.services.auth_service import resolve_client_ip, security
-from backend.app.services.datasource_query_service import query_datasource_rows
-from backend.app.services.datasource_service import get_datasource_detail, list_field_meta, serialize_datasource
-from backend.app.services.mcp_service import decode_mcp_token, issue_mcp_token, mark_mcp_token_used, validate_mcp_token_record
+from backend.app.services.datasource_query_service import BUSINESS_DETAIL_SOURCE_KEYS, query_datasource_rows
+from backend.app.services.datasource_service import (
+    get_business_columns,
+    get_datasource_detail,
+    list_field_meta,
+    parse_datasource_config,
+    serialize_datasource,
+)
+from backend.app.services.mcp_service import (
+    check_mcp_token_anomaly,
+    decode_mcp_token,
+    mark_mcp_token_used,
+    record_mcp_rejection,
+    validate_mcp_token_record,
+)
 from backend.app.services.permission_service import has_source_permission
 
 router = APIRouter()
 
 PUBLIC_URL = os.getenv("DATAMID_PUBLIC_URL", f"http://localhost:{APP_PORT}").rstrip("/")
+
+
+def _validate_mcp_token_with_audit(conn, raw_token: str, payload: dict[str, Any], source_key: str, request: Request):
+    try:
+        return validate_mcp_token_record(conn, raw_token, payload, source_key)
+    except HTTPException as exc:
+        record_mcp_rejection(payload, source_key, resolve_client_ip(request), str(exc.detail))
+        raise
 
 
 @router.get("/api/data/{source_key}")
@@ -35,6 +56,10 @@ def api_data(
     keyword: str = "",
     as_of: str = "",
     sync_version: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    start_date: str = "",
+    end_date: str = "",
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     user=Depends(get_current_user),
@@ -54,6 +79,10 @@ def api_data(
             allowed or user["role"] == "admin",
             as_of=as_of,
             sync_version=sync_version,
+            start_time=start_time,
+            end_time=end_time,
+            start_date=start_date,
+            end_date=end_date,
             user=user,
         )
         record_audit_log(
@@ -61,7 +90,7 @@ def api_data(
             user["role"],
             "view_data",
             source_key,
-            f"keyword={keyword.strip() or ''};preview_only={int(result['preview_only'])};as_of={as_of.strip()};sync_version={sync_version.strip()}",
+            f"keyword={keyword.strip() or ''};preview_only={int(result['preview_only'])};as_of={as_of.strip()};sync_version={sync_version.strip()};start_time={start_time.strip()};end_time={end_time.strip()};business_time_field={result.get('business_time_field', '')}",
             resolve_client_ip(request),
             user_id=int(user["id"]),
             employee_no=user["employee_no"] or "",
@@ -69,6 +98,9 @@ def api_data(
             source_name=datasource["source_name"] or source_key,
             keyword=keyword.strip(),
             as_of=as_of.strip(),
+            start_time=result.get("start_time", ""),
+            end_time=result.get("end_time", ""),
+            business_time_field=result.get("business_time_field", ""),
             page=page,
             page_size=page_size,
             row_count=len(result.get("rows", [])),
@@ -81,16 +113,23 @@ def api_data(
         conn.close()
 
 
+def _extract_mcp_token(request: Request) -> str:
+    """Extract MCP token from Authorization header or URL query parameter (legacy)."""
+    auth = request.headers.get("Authorization", "")
+    raw_token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if raw_token:
+        return raw_token
+    return str(request.query_params.get("mcp_token") or request.query_params.get("token") or "").strip()
+
+
 def _authenticate_mcp_token(
     credentials: HTTPAuthorizationCredentials | None,
     source_key: str,
     request: Request,
 ) -> tuple[str, dict[str, Any]]:
-    raw_token = None
-    if credentials is not None:
-        raw_token = credentials.credentials
-    if not raw_token:
-        raw_token = request.query_params.get("mcp_token") or request.query_params.get("token")
+    raw_token = _extract_mcp_token(request)
+    if not raw_token and credentials is not None:
+        raw_token = credentials.credentials.strip()
     if not raw_token:
         raise HTTPException(status_code=401, detail="Missing MCP token")
     payload = decode_mcp_token(raw_token)
@@ -112,20 +151,84 @@ def _make_json_serializable(value: Any) -> Any:
     return value
 
 
-def _build_mcp_tool(source_key: str, datasource: Any) -> dict[str, Any]:
+def _build_mcp_tool(source_key: str, datasource: Any, field_meta: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     source_name = datasource["source_name"] or source_key
+    config = parse_datasource_config(datasource)
+    business_time_field = str(config.get("business_time_field") or "").strip()
+    is_business_detail = source_key in BUSINESS_DETAIL_SOURCE_KEYS
+    properties: dict[str, Any] = {
+        "keyword": {"type": "string", "description": "搜索关键词，支持配置字段的不区分大小写模糊查询"},
+        "page": {"type": "integer", "description": "页码，默认 1", "minimum": 1},
+        "page_size": {
+            "type": "integer",
+            "description": f"每页条数，默认 {MCP_DEFAULT_PAGE_SIZE}，最大 {MCP_MAX_PAGE_SIZE}",
+            "minimum": 1,
+            "maximum": MCP_MAX_PAGE_SIZE,
+            "default": MCP_DEFAULT_PAGE_SIZE,
+        },
+        "as_of": {"type": "string", "description": "历史快照时间，格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS（可选）"},
+        "filters": {
+            "type": "object",
+            "description": "字段级过滤条件，键为字段名/中文标签/标准字段名，值为要包含的字符串；多个条件之间是 AND 关系，使用不区分大小写的包含匹配。必须把用户指定的公司、员工、单号等条件放入此处，由服务端在完整数据集上先筛选。",
+            "additionalProperties": {"type": "string"},
+        },
+    }
+    required: list[str] = []
+    if business_time_field:
+        properties["start_date"] = {
+            "type": "string",
+            "format": "date",
+            "description": f"统计开始日期，格式 YYYY-MM-DD，包含当天；按 {business_time_field} 过滤",
+        }
+        properties["end_date"] = {
+            "type": "string",
+            "format": "date",
+            "description": f"统计结束日期，格式 YYYY-MM-DD，包含当天；按 {business_time_field} 过滤",
+        }
+        if is_business_detail:
+            required.extend(["start_date", "end_date"])
+    filterable_fields: list[str] = []
+    for row in field_meta or []:
+        name = str(row.get("field_name") or "").strip()
+        label = str(row.get("field_label") or name).strip()
+        standard = str(row.get("standard_field_name") or "").strip()
+        if name:
+            parts = [name]
+            if label:
+                parts.append(label)
+            if standard:
+                parts.append(standard)
+            filterable_fields.append("/".join(parts))
+    fields_text = f" 可过滤字段：{', '.join(filterable_fields)}" if filterable_fields else ""
+
+    # 根据数据源补充特殊说明
+    extra_notes = ""
+    if source_key == "new_employee_info":
+        extra_notes = " 人员查询通常需要在 filters 中传入 {\"fbm\": \"/衡阳镭目/采购部\"}，结果包含在职和离职人员。"
+    elif source_key == "erp_asset_purchase_detail":
+        extra_notes = " 固定资产业务员字段为 sal_no_pona。"
+    elif source_key == "erp_subcontract_detail":
+        extra_notes = " 托工制单人字段为 usr（对应接口文档 USR_NAME）。"
+    elif source_key == "erp_other_expense_detail":
+        extra_notes = " 其它支出只有费用总额，无采购数量与单价，直接按金额字段计入。"
+
+    input_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+    }
+    if required:
+        input_schema["required"] = required
+
     return {
         "name": f"query_{source_key}",
-        "description": f"查询 {source_name} 数据。支持按关键词模糊搜索品号、品名等字段，返回分页数据。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "keyword": {"type": "string", "description": "搜索关键词，支持品号、品名等模糊查询"},
-                "page": {"type": "integer", "description": "页码，默认 1"},
-                "page_size": {"type": "integer", "description": "每页条数，默认 20，最大 200"},
-                "as_of": {"type": "string", "description": "历史版本时间，格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS（可选）"},
-            },
-        },
+        "description": (
+            f"查询 {source_name} 数据。支持关键词、分页、历史快照、字段级过滤"
+            + (f"和按 {business_time_field} 的业务时间范围过滤。" if business_time_field else "。")
+            + "必须把用户指定的公司、供应商、员工、工号、单号等条件放入 filters 参数，由 PostgreSQL 在完整数据集上先筛选，再分页返回。禁止只读取第一页后就在本地判断没有找到。"
+            + extra_notes
+            + fields_text
+        ),
+        "inputSchema": input_schema,
     }
 
 
@@ -157,14 +260,16 @@ def _handle_mcp_jsonrpc(
     if method == "tools/list":
         conn = get_connection()
         try:
-            validate_mcp_token_record(conn, raw_token, payload, source_key)
+            _validate_mcp_token_with_audit(conn, raw_token, payload, source_key, request)
             datasource = get_datasource_detail(conn, source_key)
             if not datasource:
                 return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "Datasource not found"}}
+            all_columns = get_business_columns(conn, datasource)
+            field_meta = list_field_meta(conn, datasource, all_columns)
             return {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
-                "result": {"tools": [_build_mcp_tool(source_key, datasource)]},
+                "result": {"tools": [_build_mcp_tool(source_key, datasource, field_meta)]},
             }
         finally:
             conn.close()
@@ -177,7 +282,9 @@ def _handle_mcp_jsonrpc(
         arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         conn = get_connection()
         try:
-            token_row = validate_mcp_token_record(conn, raw_token, payload, source_key)
+            ip = resolve_client_ip(request)
+            token_row = _validate_mcp_token_with_audit(conn, raw_token, payload, source_key, request)
+            check_mcp_token_anomaly(conn, token_row, payload, source_key, ip)
             datasource = get_datasource_detail(conn, source_key)
             if not datasource:
                 return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "Datasource not found"}}
@@ -185,21 +292,29 @@ def _handle_mcp_jsonrpc(
             if not mcp_user:
                 return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "MCP token user no longer exists"}}
             # MCP 调用已鉴权，强制返回真实数据（不允许演示模式）
+            raw_filters = arguments.get("filters")
+            applied_filters = raw_filters if isinstance(raw_filters, dict) else None
+            requested_page_size = int(arguments.get("page_size", MCP_DEFAULT_PAGE_SIZE))
+            page_size = max(1, min(requested_page_size, MCP_MAX_PAGE_SIZE))
             result = query_datasource_rows(
                 conn,
                 datasource,
                 str(arguments.get("keyword", "")),
                 max(1, int(arguments.get("page", 1))),
-                max(1, min(int(arguments.get("page_size", 20)), 200)),
+                page_size,
                 allow_real_data=True,
                 as_of=str(arguments.get("as_of", "")),
+                start_time=str(arguments.get("start_time", "")),
+                end_time=str(arguments.get("end_time", "")),
+                start_date=str(arguments.get("start_date", "")),
+                end_date=str(arguments.get("end_date", "")),
+                filters=applied_filters,
                 user=mcp_user,
             )
             # 安全兜底：确保 MCP 不会把演示数据返回给客户端
             if result.get("preview_only"):
                 result["preview_only"] = False
                 result["message"] = "ok"
-            ip = resolve_client_ip(request)
             if token_row is not None:
                 mark_mcp_token_used(conn, int(token_row["id"]), ip)
                 conn.commit()
@@ -208,7 +323,7 @@ def _handle_mcp_jsonrpc(
                 "user",
                 "mcp_tool_call",
                 source_key,
-                f"token_id={int(token_row['id']) if token_row else ''};jti={payload.get('jti') or ''};dept={payload.get('department') or ''};employee={payload.get('employee_no') or ''};keyword={str(arguments.get('keyword', '')).strip()};page={int(arguments.get('page', 1))};page_size={max(1, min(int(arguments.get('page_size', 20)), 200))};row_count={len(result.get('rows', []))};total_count={int(result.get('total', 0))};as_of={str(arguments.get('as_of', '')).strip()};search_fields={','.join(result.get('search_fields', []))};accessed_fields={','.join(result.get('columns', []))}",
+                f"token_id={int(token_row['id']) if token_row else ''};jti={payload.get('jti') or ''};dept={payload.get('department') or ''};employee={payload.get('employee_no') or ''};keyword={str(arguments.get('keyword', '')).strip()};page={int(arguments.get('page', 1))};page_size={page_size};row_count={len(result.get('rows', []))};total_count={int(result.get('total', 0))};as_of={str(arguments.get('as_of', '')).strip()};start_time={result.get('start_time', '')};end_time={result.get('end_time', '')};business_time_field={result.get('business_time_field', '')};filters={json.dumps(applied_filters or {}, ensure_ascii=False)};search_fields={','.join(result.get('search_fields', []))};accessed_fields={','.join(result.get('columns', []))}",
                 ip,
                 user_id=int(payload.get("uid") or 0) or None,
                 employee_no=payload.get("employee_no") or "",
@@ -218,8 +333,11 @@ def _handle_mcp_jsonrpc(
                 source_name=datasource["source_name"] or source_key,
                 keyword=str(arguments.get("keyword", "")).strip(),
                 as_of=str(arguments.get("as_of", "")).strip(),
+                start_time=result.get("start_time", ""),
+                end_time=result.get("end_time", ""),
+                business_time_field=result.get("business_time_field", ""),
                 page=max(1, int(arguments.get("page", 1))),
-                page_size=max(1, min(int(arguments.get("page_size", 20)), 200)),
+                page_size=page_size,
                 row_count=len(result.get("rows", [])),
                 total_count=int(result.get("total") or 0),
                 search_fields=",".join(result.get("search_fields", [])),
@@ -264,8 +382,13 @@ def api_mcp_data(
     body: dict[str, Any] | None = None,
     keyword: str = "",
     as_of: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    filters: str = "",
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=200),
+    page_size: int = Query(MCP_DEFAULT_PAGE_SIZE, ge=1, le=MCP_MAX_PAGE_SIZE),
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> dict[str, Any]:
     """兼容旧的 MCP JSON-RPC over HTTP 端点（GET 普通查询 / POST JSON-RPC）。"""
@@ -277,9 +400,18 @@ def api_mcp_data(
 
     # GET 保持原有普通查询行为
     ip = resolve_client_ip(request)
+    parsed_filters = None
+    if filters:
+        try:
+            parsed = json.loads(filters)
+            parsed_filters = parsed if isinstance(parsed, dict) else None
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid filters JSON")
+    effective_page_size = max(1, min(page_size, MCP_MAX_PAGE_SIZE))
     conn = get_connection()
     try:
-        token_row = validate_mcp_token_record(conn, raw_token, payload, source_key)
+        token_row = _validate_mcp_token_with_audit(conn, raw_token, payload, source_key, request)
+        check_mcp_token_anomaly(conn, token_row, payload, source_key, ip)
         datasource = get_datasource_detail(conn, source_key)
         if not datasource:
             raise HTTPException(status_code=404, detail="Datasource not found")
@@ -292,9 +424,14 @@ def api_mcp_data(
             datasource,
             keyword,
             page,
-            page_size,
+            effective_page_size,
             allow_real_data=True,
             as_of=as_of,
+            start_time=start_time,
+            end_time=end_time,
+            start_date=start_date,
+            end_date=end_date,
+            filters=parsed_filters,
             user=mcp_user,
         )
         # 安全兜底：确保 MCP 不会把演示数据返回给客户端
@@ -309,7 +446,7 @@ def api_mcp_data(
             "user",
             "mcp_query",
             source_key,
-            f"dept={payload.get('department') or ''} employee={payload.get('employee_no') or ''} ip={ip} keyword={keyword.strip() or ''} as_of={as_of.strip()} search_fields={','.join(result.get('search_fields', []))}",
+            f"dept={payload.get('department') or ''} employee={payload.get('employee_no') or ''} ip={ip} keyword={keyword.strip() or ''} as_of={as_of.strip()} start_time={result.get('start_time', '')} end_time={result.get('end_time', '')} business_time_field={result.get('business_time_field', '')} search_fields={','.join(result.get('search_fields', []))}",
             ip,
             user_id=int(payload.get("uid") or 0) or None,
             employee_no=payload.get("employee_no") or "",
@@ -319,6 +456,9 @@ def api_mcp_data(
             source_name=datasource["source_name"] or source_key,
             keyword=keyword.strip(),
             as_of=as_of.strip(),
+            start_time=result.get("start_time", ""),
+            end_time=result.get("end_time", ""),
+            business_time_field=result.get("business_time_field", ""),
             page=page,
             page_size=page_size,
             row_count=len(result.get("rows", [])),
@@ -333,7 +473,7 @@ def api_mcp_data(
 
 # ======== MCP over SSE ========
 # 标准 MCP SSE 传输：
-# 1. 客户端 GET /api/mcp/sse/{source_key}?mcp_token=...
+# 1. 客户端通过 Authorization 请求头 GET /api/mcp/sse/{source_key}
 # 2. 服务端返回 SSE 流，首先发送 endpoint 事件
 # 3. 客户端 POST JSON-RPC 到该 endpoint
 # 4. 服务端通过 SSE 流返回响应
@@ -344,17 +484,9 @@ _SSE_SESSION_TTL_SECONDS = 300
 _SSE_HEARTBEAT_SECONDS = 30
 
 
-def _authenticate_mcp_token_query(request: Request, source_key: str) -> tuple[str, dict[str, Any]]:
-    """从 query param 或 header 提取并校验 MCP token。"""
-    raw_token = None
-    try:
-        auth = request.headers.get("Authorization", "")
-        if auth.lower().startswith("bearer "):
-            raw_token = auth[7:].strip()
-    except Exception:
-        pass
-    if not raw_token:
-        raw_token = request.query_params.get("mcp_token") or request.query_params.get("token")
+def _authenticate_mcp_token_header(request: Request, source_key: str) -> tuple[str, dict[str, Any]]:
+    """Authenticate MCP with Authorization header or URL query parameter (legacy)."""
+    raw_token = _extract_mcp_token(request)
     if not raw_token:
         raise HTTPException(status_code=401, detail="Missing MCP token")
     payload = decode_mcp_token(raw_token)
@@ -439,15 +571,15 @@ def api_mcp_sse(
     request: Request,
 ) -> StreamingResponse:
     """MCP SSE 传输端点。"""
-    raw_token, payload = _authenticate_mcp_token_query(request, source_key)
+    raw_token, payload = _authenticate_mcp_token_header(request, source_key)
     conn = get_connection()
     try:
-        validate_mcp_token_record(conn, raw_token, payload, source_key)
+        _validate_mcp_token_with_audit(conn, raw_token, payload, source_key, request)
     finally:
         conn.close()
     session_id, q = _create_sse_session(source_key, raw_token, payload)
 
-    endpoint_url = f"{PUBLIC_URL}/api/mcp/message/{source_key}?session_id={session_id}&mcp_token={raw_token}"
+    endpoint_url = f"{PUBLIC_URL}/api/mcp/message/{source_key}?session_id={session_id}"
 
     def event_stream():
         try:
@@ -486,12 +618,14 @@ def api_mcp_message(
     session_id: str = Query(...),
 ) -> Response:
     """MCP SSE 消息接收端点。"""
-    raw_token, payload = _authenticate_mcp_token_query(request, source_key)
+    raw_token, payload = _authenticate_mcp_token_header(request, source_key)
     sess = _get_sse_session(session_id)
     if sess is None:
         raise HTTPException(status_code=404, detail="SSE session not found or expired")
     if sess["source_key"] != source_key:
         raise HTTPException(status_code=403, detail="Session source key mismatch")
+    if not hmac.compare_digest(raw_token, str(sess.get("raw_token") or "")):
+        raise HTTPException(status_code=403, detail="MCP token does not match the SSE session")
 
     result = _handle_mcp_jsonrpc(source_key, body, raw_token, payload, request)
     sess["queue"].put(result)
@@ -504,27 +638,24 @@ def _build_api_doc_markdown(
     ds_info: dict[str, Any],
     field_meta: list[dict[str, Any]],
     *,
-    mcp_token: str = "",
     public_url: str = "",
 ) -> str:
     """根据数据源信息生成 Markdown 接口文档。"""
-    token = str(mcp_token or "").strip()
     base_url = str(public_url or "").rstrip("/")
-    mcp_url = f"{base_url}/api/mcp/sse/{source_key}?mcp_token={token}" if token and base_url else ""
-    config_json = ""
-    if token and base_url:
-        config_json = json.dumps(
-            {
-                "mcpServers": {
-                    f"ramon-datamid-{source_key}": {
-                        "url": mcp_url,
-                        "description": f"Datamid MCP endpoint for {source_key}",
-                    }
+    mcp_url = f"{base_url}/api/mcp/sse/{source_key}" if base_url else f"/api/mcp/sse/{source_key}"
+    config_json = json.dumps(
+        {
+            "mcpServers": {
+                f"ramon-datamid-{source_key}": {
+                    "url": mcp_url,
+                    "headers": {"Authorization": "Bearer <your_mcp_token>"},
+                    "description": f"Datamid MCP endpoint for {source_key}",
                 }
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+            }
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
     lines: list[str] = []
     lines.append(f"# {ds_info.get('source_name', source_key)} 接口文档")
@@ -540,62 +671,37 @@ def _build_api_doc_markdown(
     lines.append(f"- **描述**：{ds_info.get('description') or '—'}")
     lines.append(f"- **最近同步**：{ds_info.get('last_sync_at') or '—'}")
     lines.append(f"- **当前版本**：{ds_info.get('current_sync_version') or '—'}")
+    business_time_field = str(ds_info.get("business_time_field") or "").strip()
+    lines.append(f"- **业务时间字段**：`{business_time_field}`" if business_time_field else "- **业务时间字段**：未配置")
     lines.append("")
 
-    if token:
-        lines.append("## MCP 令牌（已内置）")
-        lines.append("")
-        lines.append("本接口文档已自动为你生成 MCP 令牌，可直接复制使用。")
-        lines.append("")
-        lines.append(f"- **MCP 调用 URL**：`{mcp_url}`")
-        lines.append(f"- **令牌值**：`{token}`")
-        lines.append("")
-        lines.append("### MCP Servers 配置")
-        lines.append("")
-        lines.append("```json")
-        lines.append(config_json)
-        lines.append("```")
-        lines.append("")
+    lines.append("## MCP Servers 配置模板")
+    lines.append("")
+    lines.append("本文档不会自动签发或显示令牌。请通过「MCP 导出」显式签发，并将 `<your_mcp_token>` 替换为签发时仅展示一次的令牌。")
+    lines.append("")
+    lines.append("```json")
+    lines.append(config_json)
+    lines.append("```")
+    lines.append("")
 
     lines.append("## 认证方式")
     lines.append("")
-    if token:
-        lines.append("本次已生成令牌，调用时直接使用下方示例中的 URL 或 Authorization 头即可。")
-        lines.append("")
-        lines.append("1. URL 查询参数：")
-        lines.append(f"   ```\n   {mcp_url}\n   ```")
-        lines.append("2. 请求头认证：")
-        lines.append(f"   ```\n   Authorization: Bearer {token}\n   ```")
-    else:
-        lines.append("调用 MCP 数据查询接口时，可通过以下两种方式之一进行认证：")
-        lines.append("")
-        lines.append("1. 在 URL 查询参数中携带 `mcp_token`：")
-        lines.append(f"   ```\n   /api/mcp/sse/{source_key}?mcp_token=<your_mcp_token>\n   ```")
-        lines.append("2. 在请求头中提供：")
-        lines.append("   ```\n   Authorization: Bearer <your_mcp_token>\n   ```")
+    lines.append("所有 MCP 请求都必须使用请求头认证；URL 查询参数中的令牌会被拒绝：")
+    lines.append("")
+    lines.append("```\nAuthorization: Bearer <your_mcp_token>\n```")
     lines.append("")
 
-    request_config = ds_info.get("request_config") or {}
-    parameter_docs = request_config.get("parameter_docs") if isinstance(request_config.get("parameter_docs"), list) else []
     lines.append("## 请求参数")
     lines.append("")
-    if parameter_docs:
-        lines.append("| 参数名 | 中文名 | 类型 | 必填 | 说明 |")
-        lines.append("|---|---|---|---|---|")
-        for item in parameter_docs:
-            name = str(item.get("name") or "")
-            label = str(item.get("label") or item.get("name") or "")
-            param_type = str(item.get("type") or item.get("data_type") or "string")
-            required = "是" if item.get("required") else "否"
-            desc = str(item.get("description") or "")
-            lines.append(f"| {name} | {label} | {param_type} | {required} | {desc} |")
-    else:
-        lines.append("| 参数名 | 类型 | 必填 | 说明 |")
-        lines.append("|---|---|---|---|")
-        lines.append("| keyword | string | 否 | 搜索关键词，支持品号、品名等模糊查询 |")
-        lines.append("| page | integer | 否 | 页码，默认 1 |")
-        lines.append("| page_size | integer | 否 | 每页条数，默认 20，最大 200 |")
-        lines.append("| as_of | string | 否 | 历史版本时间，格式 `YYYY-MM-DD` 或 `YYYY-MM-DD HH:MM:SS` |")
+    lines.append("| 参数名 | 类型 | 必填 | 说明 |")
+    lines.append("|---|---|---|---|")
+    lines.append("| keyword | string | 否 | 搜索关键词，按配置的可搜索字段模糊查询 |")
+    lines.append("| page | integer | 否 | 页码，默认 1 |")
+    lines.append(f"| page_size | integer | 否 | 每页条数，默认 {MCP_DEFAULT_PAGE_SIZE}，最大 {MCP_MAX_PAGE_SIZE} |")
+    lines.append("| as_of | string | 否 | 历史快照时间，格式 `YYYY-MM-DD` 或 `YYYY-MM-DD HH:MM:SS` |")
+    if business_time_field:
+        lines.append(f"| start_date | string | {'是' if source_key in BUSINESS_DETAIL_SOURCE_KEYS else '否'} | `{business_time_field}` 的开始日期，格式 `YYYY-MM-DD`，闭区间 |")
+        lines.append(f"| end_date | string | {'是' if source_key in BUSINESS_DETAIL_SOURCE_KEYS else '否'} | `{business_time_field}` 的结束日期，格式 `YYYY-MM-DD`，闭区间 |")
     lines.append("")
 
     lines.append("## 响应字段")
@@ -624,10 +730,10 @@ def _build_api_doc_markdown(
         lines.append("未配置可搜索字段。")
     lines.append("")
 
-    auth_header = f"Authorization: Bearer {token}" if token else "Authorization: Bearer <your_mcp_token>"
+    auth_header = "Authorization: Bearer <your_mcp_token>"
     lines.append("## 请求示例")
     lines.append("")
-    lines.append(f"```http\nPOST /api/mcp/message/{source_key}?session_id=<session_id>&mcp_token=<your_mcp_token>\nContent-Type: application/json\n{auth_header}\n")
+    lines.append(f"```http\nPOST /api/mcp/message/{source_key}?session_id=<session_id>\nContent-Type: application/json\n{auth_header}\n")
     lines.append("\n{")
     lines.append('  "jsonrpc": "2.0",')
     lines.append('  "method": "tools/call",')
@@ -637,7 +743,12 @@ def _build_api_doc_markdown(
     lines.append('    "arguments": {')
     lines.append('      "keyword": "示例关键词",')
     lines.append('      "page": 1,')
-    lines.append('      "page_size": 20')
+    if business_time_field:
+        lines.append(f'      "page_size": {MCP_DEFAULT_PAGE_SIZE},')
+        lines.append('      "start_date": "2026-07-01",')
+        lines.append('      "end_date": "2026-07-13"')
+    else:
+        lines.append(f'      "page_size": {MCP_DEFAULT_PAGE_SIZE}')
     lines.append('    }')
     lines.append('  }')
     lines.append('}\n```')
@@ -665,12 +776,19 @@ def _build_api_doc_markdown(
     lines.append("## 注意事项")
     lines.append("")
     lines.append("- 接口文档中的字段以最近一次同步成功的版本为准。")
-    if token:
-        lines.append("- 文档中的 MCP 令牌具有有效期，过期后请在「MCP 导出」中重新生成。")
-        lines.append("- 请妥善保管令牌，不要将其提交到公共代码仓库或分享给无权限人员。")
-    else:
-        lines.append("- 如需获取真实数据，请先在「MCP 导出」中申请并生成 MCP 令牌。")
+    lines.append("- 如需获取真实数据，请先在「MCP 导出」中申请并显式生成 MCP 令牌。")
+    lines.append("- 令牌只在签发响应中展示一次；请妥善保管，不要写入 URL、日志或公共代码仓库。")
     lines.append("- 历史版本查询通过 `as_of` 参数指定时间戳实现。")
+    if business_time_field:
+        lines.append(f"- 业务时间范围通过 `start_date`、`end_date` 过滤字段 `{business_time_field}`，与 `as_of` 历史快照可组合使用。")
+    if source_key == "new_employee_info":
+        lines.append("- 人员查询通常需要在 filters 中传入 `{\"fbm\": \"/衡阳镭目/采购部\"}`，结果包含在职和离职人员。")
+    if source_key == "erp_asset_purchase_detail":
+        lines.append("- 固定资产业务员字段为 `sal_no_pona`。")
+    if source_key == "erp_subcontract_detail":
+        lines.append("- 托工制单人字段为 `usr`（对应接口文档 `USR_NAME`）。")
+    if source_key == "erp_other_expense_detail":
+        lines.append("- 其它支出只有费用总额，无采购数量与单价，直接按金额字段计入。")
     lines.append("")
 
     return "\n".join(lines)
@@ -682,7 +800,7 @@ def api_mcp_doc(
     request: Request,
     user=Depends(get_current_user),
 ) -> dict[str, Any]:
-    """返回带 MCP 令牌的 Markdown 接口文档（供前端弹窗展示）。
+    """返回不含凭据的 Markdown 接口文档（供前端弹窗展示）。
 
     权限与 MCP 导出一致：管理员任意访问，普通用户需有该数据源权限。
     """
@@ -695,17 +813,12 @@ def api_mcp_doc(
         if user["role"] != "admin" and not has_source_permission(conn, user, source_key):
             raise HTTPException(status_code=403, detail="No permission to access this datasource")
 
-        # 自动生成 MCP 令牌并写入文档，与「MCP 导出」使用相同权限
-        issued = issue_mcp_token(conn, user, [source_key], bind_ip=False, ip=client_ip)
-        conn.commit()
-
         ds_info = serialize_datasource(conn, datasource, user)
         field_meta = list_field_meta(conn, datasource)
         markdown = _build_api_doc_markdown(
             source_key,
             ds_info,
             field_meta,
-            mcp_token=issued["token"],
             public_url=PUBLIC_URL,
         )
 
@@ -714,15 +827,14 @@ def api_mcp_doc(
             user["role"],
             "view_api_doc",
             source_key,
-            f"source_name={ds_info.get('source_name', '')};token_id={issued.get('id', '')}",
+            f"source_name={ds_info.get('source_name', '')};credential_issued=0",
             client_ip,
         )
 
         return {
             "source_key": source_key,
             "source_name": ds_info.get("source_name", ""),
-            "mcp_token": issued["token"],
-            "expires_at": issued["expires_at"],
+            "credential_issued": False,
             "markdown": markdown,
         }
     finally:

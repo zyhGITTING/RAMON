@@ -7,7 +7,12 @@ from typing import Any
 from fastapi import HTTPException
 
 from backend.app.db.repositories.config import get_config, now_text, set_config
-from backend.app.services.datasource_service import ensure_ods_table
+from backend.app.db.repositories.sync_checkpoint import get_checkpoint, reset_checkpoint
+from backend.app.services.datasource_service import (
+    ensure_ods_table,
+    get_datasource_detail,
+    table_exists,
+)
 from backend.app.services.sync_progress_service import (
     is_sync_running,
     request_sync_cancel,
@@ -29,6 +34,7 @@ __all__ = [
     "is_sync_running",
     "request_sync_cancel",
     "snapshot_sync_progress",
+    "reset_datasource_checkpoint",
 ]
 
 
@@ -78,6 +84,7 @@ def get_sync_status_payload(conn) -> dict[str, Any]:
                 next_sync_in = max(0, int((next_dt - now_dt).total_seconds()))
             except ValueError:
                 next_sync_in = None
+        checkpoint = get_checkpoint(conn, ds["source_key"]) or {}
         cooldowns[ds["source_key"]] = {
             "source_key": ds["source_key"],
             "source_name": ds["source_name"],
@@ -86,6 +93,15 @@ def get_sync_status_payload(conn) -> dict[str, Any]:
             "remaining": next_sync_in or 0,
             "next_sync_in": next_sync_in,
             "sync_interval_seconds": ds.get("sync_interval_seconds"),
+            "checkpoint": {
+                "status": checkpoint.get("status", "completed"),
+                "strategy": checkpoint.get("strategy", "full"),
+                "last_fetched_page": int(checkpoint.get("last_fetched_page") or 0),
+                "last_fetched_row_count": int(checkpoint.get("last_fetched_row_count") or 0),
+                "failed_attempts": int(checkpoint.get("failed_attempts") or 0),
+                "last_error": checkpoint.get("last_error", "") or "",
+                "updated_at": checkpoint.get("updated_at"),
+            } if checkpoint else None,
         }
     seconds_until_next = None
     if auto_enabled:
@@ -101,6 +117,22 @@ def get_sync_status_payload(conn) -> dict[str, Any]:
         "seconds_until_next": seconds_until_next,
         "cooldowns": cooldowns,
         "progress": snapshot_sync_progress(),
+    }
+
+
+def reset_datasource_checkpoint(conn, source_key: str, *, force_full_sync: bool = True) -> dict[str, Any]:
+    """Truncate staging and reset checkpoint so the next sync starts fresh."""
+    ds = get_datasource_detail(conn, source_key, include_disabled=True)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Datasource not found")
+    staging_name = f"stg_{ds['table_name']}"
+    if table_exists(conn, staging_name):
+        conn.execute(f"TRUNCATE TABLE {quote_identifier(staging_name)}")
+    reset_checkpoint(conn, source_key, strategy="full")
+    return {
+        "source_key": source_key,
+        "message": "Checkpoint reset; next sync will start from page 1",
+        "staging_truncated": table_exists(conn, staging_name),
     }
 
 

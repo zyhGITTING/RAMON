@@ -29,6 +29,9 @@ def record_audit_log(
     source_name: str = "",
     keyword: str = "",
     as_of: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    business_time_field: str = "",
     page: int | None = None,
     page_size: int | None = None,
     row_count: int | None = None,
@@ -43,9 +46,10 @@ def record_audit_log(
             INSERT INTO sys_audit_log (
                 username, role, action, target, detail, ip, created_at,
                 user_id, employee_no, department, token_id, jti, source_name,
-                keyword, as_of, page, page_size, row_count, total_count,
+                keyword, as_of, start_time, end_time, business_time_field,
+                page, page_size, row_count, total_count,
                 search_fields, accessed_fields
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 username,
@@ -63,6 +67,9 @@ def record_audit_log(
                 source_name,
                 keyword,
                 as_of,
+                start_time,
+                end_time,
+                business_time_field,
                 page,
                 page_size,
                 row_count,

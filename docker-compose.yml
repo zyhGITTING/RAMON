@@ -1,25 +1,125 @@
 name: datamid
 
 services:
+  backup-storage-init:
+    image: postgres:16-alpine
+    container_name: datamid-backup-storage-init
+    restart: "no"
+    user: "0:0"
+    volumes:
+      - ${DATAMID_BACKUP_DIR:-./backups}:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        umask 077;
+        mkdir -p /backups/logical /backups/base /backups/wal;
+        chown -R postgres:postgres /backups;
+        chmod 0700 /backups /backups/logical /backups/base /backups/wal
+
   postgres:
     image: postgres:16-alpine
     container_name: datamid-pg
     restart: unless-stopped
+    depends_on:
+      backup-storage-init:
+        condition: service_completed_successfully
     environment:
       POSTGRES_DB: datamid
-      POSTGRES_USER: datamid
-      POSTGRES_PASSWORD: ${DATAMID_DB_PASSWORD:?Set DATAMID_DB_PASSWORD in .env}
+      POSTGRES_USER: datamid_owner
+      POSTGRES_PASSWORD: ${DATAMID_DB_ADMIN_PASSWORD:?Set DATAMID_DB_ADMIN_PASSWORD in .env}
       TZ: Asia/Shanghai
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=600s
+      - -c
+      - archive_command=test ! -f /backups/wal/%f && cp %p /backups/wal/%f
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - pgsocket:/var/run/postgresql
+      - ${DATAMID_BACKUP_DIR:-./backups}:/backups
       - ./backend/init_pg.sql:/docker-entrypoint-initdb.d/01-init.sql
     ports:
       - "127.0.0.1:5430:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U datamid"]
+      test: ["CMD-SHELL", "pg_isready -U datamid_owner -d datamid"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  db-role-init:
+    image: postgres:16-alpine
+    container_name: datamid-db-role-init
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATAMID_DB_HOST: postgres
+      DATAMID_DB_PORT: 5432
+      DATAMID_DB_NAME: datamid
+      DATAMID_DB_ADMIN_PASSWORD: ${DATAMID_DB_ADMIN_PASSWORD:?Set DATAMID_DB_ADMIN_PASSWORD in .env}
+      DATAMID_DB_PASSWORD: ${DATAMID_DB_PASSWORD:?Set DATAMID_DB_PASSWORD in .env}
+    volumes:
+      - ./backend/scripts/configure_db_roles.sh:/scripts/configure_db_roles.sh:ro
+    entrypoint: ["/bin/sh", "/scripts/configure_db_roles.sh"]
+
+  postgres-backup:
+    image: postgres:16-alpine
+    container_name: datamid-postgres-backup
+    restart: unless-stopped
+    user: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-role-init:
+        condition: service_completed_successfully
+    environment:
+      # Physical replication is intentionally performed over the shared local
+      # Unix socket. The stock cluster HBA permits local replication, while its
+      # network HBA correctly rejects replication from another container.
+      PGHOST: /var/run/postgresql
+      PGPORT: 5432
+      PGDATABASE: datamid
+      PGUSER: datamid_owner
+      DATAMID_DB_ADMIN_PASSWORD: ${DATAMID_DB_ADMIN_PASSWORD:?Set DATAMID_DB_ADMIN_PASSWORD in .env}
+      BACKUP_ROOT: /backups
+      BACKUP_INTERVAL_SECONDS: ${DATAMID_BACKUP_INTERVAL_SECONDS:-86400}
+      LOGICAL_BACKUP_RETENTION_DAYS: ${DATAMID_LOGICAL_BACKUP_RETENTION_DAYS:-14}
+      PITR_BASEBACKUP_INTERVAL_SECONDS: ${DATAMID_PITR_BASEBACKUP_INTERVAL_SECONDS:-604800}
+      PITR_BASEBACKUP_RETENTION_DAYS: ${DATAMID_PITR_BASEBACKUP_RETENTION_DAYS:-14}
+      PITR_WAL_RETENTION_DAYS: ${DATAMID_PITR_WAL_RETENTION_DAYS:-21}
+      RESTORE_VERIFY_INTERVAL_SECONDS: ${DATAMID_RESTORE_VERIFY_INTERVAL_SECONDS:-604800}
+      RESTORE_VERIFY_DATABASE: datamid_restore_verify
+      TZ: Asia/Shanghai
+    volumes:
+      - ${DATAMID_BACKUP_DIR:-./backups}:/backups
+      - pgsocket:/var/run/postgresql
+      - ./backend/scripts/postgres_backup_loop.sh:/opt/datamid/postgres_backup_loop.sh:ro
+      - ./backend/scripts/postgres_restore_verify.sh:/opt/datamid/postgres_restore_verify.sh:ro
+    entrypoint: ["/bin/sh", "/opt/datamid/postgres_backup_loop.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -s /backups/.last_success &&
+          now=$$(date +%s) &&
+          last=$$(cat /backups/.last_success) &&
+          max_age=$$((BACKUP_INTERVAL_SECONDS * 2 + 600)) &&
+          test $$((now - last)) -lt $$max_age
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 15m
 
   backend:
     build:
@@ -30,23 +130,29 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-role-init:
+        condition: service_completed_successfully
     environment:
       - DATAMID_DB_HOST=postgres
       - DATAMID_DB_PORT=5432
       - DATAMID_DB_NAME=datamid
-      - DATAMID_DB_USER=datamid
+      - DATAMID_DB_USER=datamid_app
       - DATAMID_DB_PASSWORD=${DATAMID_DB_PASSWORD:?Set DATAMID_DB_PASSWORD in .env}
       - DATAMID_HOST=0.0.0.0
       - DATAMID_PORT=8128
       - DATAMID_TOKEN_SECRET=${DATAMID_TOKEN_SECRET:?Set DATAMID_TOKEN_SECRET in .env}
       - DATAMID_RAMON_AUTH=${DATAMID_RAMON_AUTH}
       - DATAMID_ERP_COMPNO=ERP_GT
-      - DATAMID_PUBLIC_URL=${DATAMID_PUBLIC_URL:-http://YOUR_SERVER/data_center}
+      - DATAMID_PUBLIC_URL=${DATAMID_PUBLIC_URL:-http://172.17.111.60:8095/data_center}
       - DATAMID_INIT_ADMIN_PASSWORD=${DATAMID_INIT_ADMIN_PASSWORD:-}
       - DATAMID_ALLOW_SELF_REGISTER=${DATAMID_ALLOW_SELF_REGISTER:-}
+      - DATAMID_OUTBOUND_ALLOW_HOSTS=${DATAMID_OUTBOUND_ALLOW_HOSTS:-}
+      - DATAMID_MCP_DEFAULT_PAGE_SIZE=${DATAMID_MCP_DEFAULT_PAGE_SIZE:-200}
+      - DATAMID_MCP_MAX_PAGE_SIZE=${DATAMID_MCP_MAX_PAGE_SIZE:-200}
       - TZ=Asia/Shanghai
     ports:
       - "127.0.0.1:8128:8128"
 
 volumes:
   pgdata:
+  pgsocket:

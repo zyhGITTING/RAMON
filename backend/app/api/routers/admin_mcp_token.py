@@ -4,7 +4,7 @@ import json
 import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from backend.app.api.deps import get_current_user, require_admin
 from backend.app.core.config import APP_PORT
@@ -12,7 +12,16 @@ from backend.app.db.connection import get_connection
 from backend.app.db.repositories.audit import record_audit_log
 from backend.app.schemas.mcp import McpExportRequest, McpTokenExpiryUpdateRequest, McpTokenRevokeRequest
 from backend.app.services.auth_service import resolve_client_ip
-from backend.app.services.mcp_service import expire_stale_mcp_tokens, expiry_for_validity_period, issue_mcp_token, now_text, normalize_validity_period, serialize_mcp_token_row, update_mcp_token_configs
+from backend.app.services.mcp_service import (
+    MCP_TOKEN_PLACEHOLDER,
+    expire_stale_mcp_tokens,
+    expiry_for_validity_period,
+    issue_mcp_token,
+    now_text,
+    normalize_validity_period,
+    serialize_mcp_token_row,
+    update_mcp_token_configs,
+)
 from backend.app.services.permission_service import get_effective_source_keys
 
 router = APIRouter()
@@ -36,16 +45,21 @@ def _serialize_token_items(conn, rows) -> list[dict[str, Any]]:
     return items
 
 
-SSE_ENDPOINT_TEMPLATE = "{public_url}/api/mcp/sse/{item}?mcp_token={token}"
-HTTP_ENDPOINT_TEMPLATE = "{public_url}/api/mcp/data/{item}?mcp_token={token}"
+SSE_ENDPOINT_TEMPLATE = "{public_url}/api/mcp/sse/{item}"
+HTTP_ENDPOINT_TEMPLATE = "{public_url}/api/mcp/data/{item}"
 
 
 def _build_mcp_config(token: str, source_keys: list[str], endpoint_template: str, public_url: str) -> str:
+    authorization = f"Bearer {token or MCP_TOKEN_PLACEHOLDER}"
     servers = {}
     for idx, item in enumerate(source_keys):
         key = "ramon-datamid" if len(source_keys) == 1 and idx == 0 else f"ramon-datamid-{item}"
-        url = endpoint_template.format(public_url=public_url, item=item, token=token)
-        servers[key] = {"url": url, "description": f"Datamid MCP endpoint for {item}"}
+        url = endpoint_template.format(public_url=public_url, item=item)
+        servers[key] = {
+            "url": url,
+            "headers": {"Authorization": authorization},
+            "description": f"Datamid MCP endpoint for {item}",
+        }
     return json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2)
 
 
@@ -123,12 +137,14 @@ def _build_mcp_export_response(
         "source_keys": issued["source_keys"],
         "bind_ip": issued.get("bind_ip", False),
         "managed": True,
+        "credential_display": "one_time",
+        "credential_notice": "Save this token now. It cannot be retrieved after this response.",
         "config_json": config_json,
     }
 
 
 @router.post("/api/mcp/export")
-def api_mcp_export(request: Request, payload: McpExportRequest, source_key: str = Query("", alias="source_key"), user=Depends(get_current_user)) -> dict[str, Any]:
+def api_mcp_export(request: Request, response: Response, payload: McpExportRequest, source_key: str = Query("", alias="source_key"), user=Depends(get_current_user)) -> dict[str, Any]:
     """导出 MCP SSE 配置。"""
     client_ip = resolve_client_ip(request)
     conn = get_connection()
@@ -149,11 +165,13 @@ def api_mcp_export(request: Request, payload: McpExportRequest, source_key: str 
         conn.commit()
     finally:
         conn.close()
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     return _build_mcp_export_response(issued, config_json, "mcp_export", user, client_ip)
 
 
 @router.post("/api/mcp/export-http")
-def api_mcp_export_http(request: Request, payload: McpExportRequest, source_key: str = Query("", alias="source_key"), user=Depends(get_current_user)) -> dict[str, Any]:
+def api_mcp_export_http(request: Request, response: Response, payload: McpExportRequest, source_key: str = Query("", alias="source_key"), user=Depends(get_current_user)) -> dict[str, Any]:
     """导出 MCP Streamable HTTP 配置（直接 POST JSON-RPC 到该 URL）。"""
     client_ip = resolve_client_ip(request)
     conn = get_connection()
@@ -174,6 +192,8 @@ def api_mcp_export_http(request: Request, payload: McpExportRequest, source_key:
         conn.commit()
     finally:
         conn.close()
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     return _build_mcp_export_response(issued, config_json_http, "mcp_export_http", user, client_ip)
 
 
@@ -310,11 +330,14 @@ def my_mcp_token_config(token_id: int, user=Depends(get_current_user)) -> dict[s
         row = conn.execute("SELECT * FROM sys_mcp_token WHERE id = ? LIMIT 1", (token_id,)).fetchone()
         if not row or int(row["user_id"] or 0) != int(user["id"]):
             raise HTTPException(status_code=404, detail="MCP token not found")
+        source_keys = [str(item) for item in json.loads(row["source_keys_json"] or "[]")]
         return {
             "id": token_id,
-            "source_keys": [str(item) for item in json.loads(row["source_keys_json"] or "[]")],
-            "config_json": row.get("config_json") or "",
-            "config_json_http": row.get("config_json_http") or "",
+            "source_keys": source_keys,
+            "config_json": row["config_json"] or _build_mcp_config("", source_keys, SSE_ENDPOINT_TEMPLATE, PUBLIC_URL),
+            "config_json_http": row["config_json_http"] or _build_mcp_config("", source_keys, HTTP_ENDPOINT_TEMPLATE, PUBLIC_URL),
+            "credential_available": True,
+            "credential_notice": "The token is persisted with this configuration for convenience. Treat it as a secret.",
             "status": row["status"] or "active",
             "created_at": row["created_at"] or "",
             "expires_at": row["expires_at"] or "",
@@ -332,13 +355,16 @@ def admin_mcp_token_config(token_id: int, admin=Depends(require_admin)) -> dict[
         row = conn.execute("SELECT * FROM sys_mcp_token WHERE id = ? LIMIT 1", (token_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="MCP token not found")
+        source_keys = [str(item) for item in json.loads(row["source_keys_json"] or "[]")]
         return {
             "id": token_id,
             "username": row["username"] or "",
             "employee_no": row["employee_no"] or "",
-            "source_keys": [str(item) for item in json.loads(row["source_keys_json"] or "[]")],
-            "config_json": row.get("config_json") or "",
-            "config_json_http": row.get("config_json_http") or "",
+            "source_keys": source_keys,
+            "config_json": row["config_json"] or _build_mcp_config("", source_keys, SSE_ENDPOINT_TEMPLATE, PUBLIC_URL),
+            "config_json_http": row["config_json_http"] or _build_mcp_config("", source_keys, HTTP_ENDPOINT_TEMPLATE, PUBLIC_URL),
+            "credential_available": True,
+            "credential_notice": "The token is persisted with this configuration for convenience. Treat it as a secret.",
             "status": row["status"] or "active",
             "created_at": row["created_at"] or "",
             "expires_at": row["expires_at"] or "",
